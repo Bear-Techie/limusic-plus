@@ -603,9 +603,10 @@ export interface ReleaseNote {
 /** Changelog for Settings > About, from the GitHub releases API (cached in Rust per run). */
 export const releaseNotes = () => invoke<ReleaseNote[]>('release_notes');
 export const checkPlusRelease = () =>
-	invoke<{ configured: boolean; release: { version: string; downloadUrl: string } | null }>(
+	invoke<{ configured: boolean; release: { version: string; downloadUrl: string; canInstall: boolean } | null }>(
 		'check_plus_release'
 	);
+export const stagePlusUpdate = (version: string) => invoke<void>('stage_plus_update', { version });
 /** False on Linux builds that aren't the AppImage (.rpm, the AUR package): they update through the
  *  package manager, so the UI offers a download link instead of an install button. */
 export const canSelfUpdate = () => invoke<boolean>('can_self_update');

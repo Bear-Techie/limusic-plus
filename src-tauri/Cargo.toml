@@ -95,6 +95,7 @@ objc2 = "0.6"
 # Taskbar thumbnail toolbar (#47). Same `windows` version tauri-runtime-wry already pulls in, so
 # `Window::hwnd()` hands us a matching HWND.
 [target.'cfg(target_os = "windows")'.dependencies]
+tempfile = "3"
 windows = { version = "0.61", features = [
   "Foundation",
   "Foundation_Collections",

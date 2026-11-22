@@ -7,7 +7,7 @@ import { relaunch } from '@tauri-apps/plugin-process';
 import { toast } from './player.svelte';
 import { t } from './i18n.svelte';
 import { friendlyNetError } from './neterr';
-import { canSelfUpdate, checkBetaUpdate, checkPlusRelease, getSettings, openExternal, releaseNotes } from './api';
+import { canSelfUpdate, checkBetaUpdate, checkPlusRelease, getSettings, openExternal, releaseNotes, stagePlusUpdate } from './api';
 import { isNewer, isPrerelease } from './version';
 import { getIdentifier, getVersion } from '@tauri-apps/api/app';
 
@@ -19,10 +19,11 @@ export const QUIET_INTERVAL_MS = 6 * 60 * 60 * 1000;
 export const updateState = $state({
 	// Set when Latest differs from this build. `rollback` is true when Latest is OLDER than this
 	// build, which is what a pulled release looks like from the inside (see `look()`).
-	available: null as { version: string; rollback: boolean; downloadUrl?: string } | null,
+	available: null as { version: string; rollback: boolean; downloadUrl?: string; installOnQuit?: boolean } | null,
 	canInstall: true, // false on packaged Linux builds; always resolved before `available` is set
 	checking: false, // Settings "Check for updates" is in flight
-	installing: false // downloading/installing the update
+	installing: false, // downloading/installing the update
+	readyOnQuit: false
 });
 
 // The resolved handle to download; kept out of reactive state (it's not serializable/renderable).
@@ -36,8 +37,10 @@ async function look(): Promise<boolean | 'unconfigured'> {
 			updateState.available = null;
 			return false;
 		}
-		updateState.canInstall = false;
-		updateState.available = { ...release, rollback: false };
+		const { version, downloadUrl, canInstall } = release;
+		if (updateState.available?.version !== version) updateState.readyOnQuit = false;
+		updateState.canInstall = canInstall === true;
+		updateState.available = { version, downloadUrl, rollback: false, ...(canInstall && { installOnQuit: true }) };
 		return true;
 	}
 	let u: Update | null;
@@ -111,10 +114,36 @@ async function look(): Promise<boolean | 'unconfigured'> {
 
 /** The line announcing an available version. A rollback worded as "Version 0.8.2 is available!"
  *  to someone on 1.0.0 reads as a bug, so it says what is actually happening. */
-export function availableMessage(a: { version: string; rollback: boolean }): string {
+export function availableMessage(a: { version: string; rollback: boolean; installOnQuit?: boolean }): string {
+	if (a.installOnQuit && updateState.readyOnQuit) {
+		return t('settings.about.update_on_quit', { version: a.version });
+	}
 	return t(a.rollback ? 'settings.about.rollback_available' : 'settings.about.update_available', {
 		version: a.version
 	});
+}
+
+export function updateActionLabel(): string {
+	if (updateState.installing) return t('common.loading');
+	if (updateState.available?.installOnQuit) {
+		return t(updateState.readyOnQuit ? 'settings.about.update_ready' : 'settings.about.download_update');
+	}
+	return t('settings.about.install_update');
+}
+
+async function preparePlusUpdate(showError = false) {
+	const available = updateState.available;
+	if (!available?.installOnQuit || updateState.installing || updateState.readyOnQuit) return;
+	updateState.installing = true;
+	try {
+		await stagePlusUpdate(available.version);
+		if (updateState.available?.version === available.version) updateState.readyOnQuit = true;
+	} catch (e) {
+		if (showError) toast.error(t('toasts.update_failed', { error: String(e) }));
+		else console.error('update download failed', e);
+	} finally {
+		updateState.installing = false;
+	}
 }
 
 /** On app open, and every `QUIET_INTERVAL_MS` after: show the update banner if one exists, stay
@@ -124,9 +153,13 @@ export function availableMessage(a: { version: string; rollback: boolean }): str
  *  leaving Settings > About > Check for updates as the only way to find one. */
 export async function checkForUpdatesQuiet() {
 	try {
-		if (updateState.available) return; // one is already on screen; don't re-fetch behind it
 		if ((await getSettings()).update_banner === 'false') return;
+		if (updateState.available) {
+			await preparePlusUpdate();
+			return;
+		}
 		await look();
+		await preparePlusUpdate();
 	} catch (e) {
 		console.error('update check failed', e); // no endpoint / offline — don't nag on launch
 	}
@@ -146,7 +179,10 @@ export async function checkForUpdatesInteractive(): Promise<{ message: string; e
 	try {
 		const result = await look();
 		if (result === 'unconfigured') return { message: t('settings.about.plus_installer_updates'), error: false };
-		if (result) return { message: availableMessage(updateState.available!), error: false };
+		if (result) {
+			void preparePlusUpdate(true);
+			return { message: availableMessage(updateState.available!), error: false };
+		}
 		return { message: t('settings.about.up_to_date'), error: false };
 	} catch (e) {
 		// Rendered inline in the dialog rather than as a toast, so it misses the toast's own
@@ -175,6 +211,7 @@ export async function openDownloadPage() {
 
 /** Download + install the pending update, then relaunch into the new version. */
 export async function installUpdate() {
+	if (updateState.available?.installOnQuit) return preparePlusUpdate(true);
 	if (!pending) return;
 	updateState.installing = true;
 	try {

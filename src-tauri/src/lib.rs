@@ -11,6 +11,8 @@ mod devicelink;
 mod diagnostics;
 mod discord;
 mod discord_voice;
+#[cfg(windows)]
+mod plus_update;
 mod hotkeys;
 mod http;
 mod import;
@@ -865,6 +867,10 @@ pub fn run() {
     }
 
     let mut builder = tauri::Builder::default().manage(discord_voice::Broadcast::default());
+    #[cfg(windows)]
+    {
+        builder = builder.manage(plus_update::PendingUpdate::default());
+    }
 
     // Must be the first plugin registered (its documented requirement). A second launch —
     // e.g. clicking the app icon while we're hidden in the tray — re-shows this instance
@@ -1649,6 +1655,7 @@ pub fn run() {
             commands::theater_fullscreen,
             commands::release_notes,
             commands::check_plus_release,
+            commands::stage_plus_update,
             commands::can_self_update,
             commands::check_beta_update,
             commands::open_external,
@@ -1717,6 +1724,10 @@ pub fn run() {
 
             // The single place that saves positions on exit. It covers `app.exit`,
             // `request_restart`, the main window closing, and macOS Cmd+Q from the native menu.
+            #[cfg(windows)]
+            if let tauri::RunEvent::ExitRequested { code, .. } = &event {
+                plus_update::record_exit(handle, *code);
+            }
             if let tauri::RunEvent::Exit = &event {
                 handle.state::<discord_voice::Broadcast>().stop();
                 if let Some(state) = handle.try_state::<Arc<AppState>>() {
@@ -1724,6 +1735,8 @@ pub fn run() {
                     state.flush_position();
                 }
                 mini::save_position(handle);
+                #[cfg(windows)]
+                plus_update::install_on_quit(handle);
             }
         });
 }

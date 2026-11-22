@@ -54,6 +54,7 @@
 		availableMessage,
 		checkForUpdatesInteractive,
 		installUpdate,
+		updateActionLabel,
 		openDownloadPage,
 		recheckForUpdates
 	} from '$lib/updater.svelte';
@@ -1679,8 +1680,8 @@
 	{#if updateState.available && !updateState.canInstall}
 		<Button size="sm" onclick={openDownloadPage}>{t('settings.about.download_page')}</Button>
 	{:else if updateState.available}
-		<Button size="sm" onclick={installUpdate} disabled={updateState.installing}>
-			{updateState.installing ? t('common.loading') : t('settings.about.install_update')}
+		<Button size="sm" onclick={installUpdate} disabled={updateState.installing || updateState.readyOnQuit}>
+			{updateActionLabel()}
 		</Button>
 	{:else}
 		<Button variant="outline" size="sm" onclick={checkUpdates} disabled={updateState.checking}>

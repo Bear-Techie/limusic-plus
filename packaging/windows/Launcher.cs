@@ -6,6 +6,7 @@ using System.Text;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 
 [assembly: AssemblyTitle("Limusic Plus")]
@@ -65,6 +66,10 @@ internal static class Launcher {
     }
     [STAThread]
     private static int Main(string[] args) {
+        if (args.Length != 0 && args[0] == "--apply-update") {
+            try { return ApplyUpdate(args); }
+            catch (Exception error) { Log("Update failed: " + error.Message); return 1; }
+        }
         try {
             string root = AppDomain.CurrentDomain.BaseDirectory;
             foreach (string file in new[] { Path.Combine(root, AppFileName), Path.Combine(root, "limusic-sync.exe"), Path.Combine(root, "libmpv-2.dll") }) {
@@ -99,6 +104,64 @@ internal static class Launcher {
             if (args.Length == 1 && args[0] == "--check") return 1;
             MessageBox.Show(error.Message, "Limusic Plus", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 1;
+        }
+    }
+
+    private static int ApplyUpdate(string[] args) {
+        int pid;
+        if (args.Length != 5 || !Int32.TryParse(args[1], out pid) || pid <= 0 ||
+            !Regex.IsMatch(args[3], @"\A[0-9a-f]{64}\z")) return 1;
+        var stage = new DirectoryInfo(AppDomain.CurrentDomain.BaseDirectory);
+        var temp = new DirectoryInfo(Path.GetTempPath());
+        if (!stage.Name.StartsWith("limusic-plus-update-", StringComparison.Ordinal) ||
+            !String.Equals(stage.Parent.FullName, temp.FullName.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)) return 1;
+        string root = Path.GetFullPath(args[2]);
+        string setup = Path.Combine(stage.FullName, "setup.exe");
+        try {
+            // Hold the installer open read-only until it has run, so the verified bytes are the ones executed.
+            using (var stream = File.Open(setup, FileMode.Open, FileAccess.Read, FileShare.Read))
+            using (var sha256 = SHA256.Create()) {
+                string actual = BitConverter.ToString(sha256.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
+                if (!String.Equals(args[3], actual, StringComparison.Ordinal)) return 1;
+                var version = FileVersionInfo.GetVersionInfo(setup);
+                var fileVersion = new Version(version.FileMajorPart, version.FileMinorPart, version.FileBuildPart);
+                if (!String.Equals(args[4], fileVersion.ToString(), StringComparison.Ordinal)) return 1;
+                Process parent = null;
+                try { parent = Process.GetProcessById(pid); }
+                catch (ArgumentException) { } // The app has already quit.
+                if (parent != null) {
+                    using (parent) {
+                        try {
+                            if (!parent.HasExited &&
+                                (!String.Equals(parent.MainModule.FileName, Path.Combine(root, AppFileName), StringComparison.OrdinalIgnoreCase) ||
+                                !parent.WaitForExit(60000))) return 1;
+                        } catch (InvalidOperationException) {
+                            if (!parent.HasExited) throw;
+                        } catch (System.ComponentModel.Win32Exception) {
+                            if (!parent.HasExited) throw;
+                        }
+                    }
+                }
+                if (!File.Exists(Path.Combine(root, "unins000.exe"))) return 1;
+                var start = new ProcessStartInfo {
+                    FileName = setup,
+                    Arguments = "/VERYSILENT /SUPPRESSMSGBOXES /SP- /NORESTART /NOCLOSEAPPLICATIONS /DIR=\"" + root + "\"",
+                    WorkingDirectory = stage.FullName,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                };
+                using (var installer = Process.Start(start)) {
+                    installer.WaitForExit();
+                    Log("Update installer exited with code " + installer.ExitCode);
+                    return installer.ExitCode;
+                }
+            }
+        } finally {
+            try { File.Delete(setup); } catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            try { File.Delete(Assembly.GetExecutingAssembly().Location); stage.Delete(); } catch (IOException) { }
+            catch (UnauthorizedAccessException) { } // Windows can keep this runner mapped until it exits.
         }
     }
 

@@ -38,7 +38,10 @@ YouTube Music client, and grew from there.
 Limusic Plus uses its own Windows installer and release feed. When the feed is
 configured, enabling the update banner makes the app check at startup and every
 six hours until it finds an update. You can also check under **Settings → About**.
-An available update opens its GitHub release page for manual installation.
+On Windows, Limusic Plus 2.0.5 and later download signed updates and install
+them when you quit the app. The update runs in the existing installation
+directory and keeps the selected installer tasks. Older builds and releases
+without a signed update manifest use the GitHub download page.
 
 The release repository contains source code and release artifacts. Keep account
 data, playback history, room state, Discord credentials, and diagnostics out of
@@ -50,8 +53,11 @@ room data, or a telemetry payload. GitHub receives the ordinary network request.
 
 Run `scripts/build-windows-installer.ps1` to build with the
 [Limusic Plus release feed](https://github.com/Bear-Techie/limusic-plus/releases).
-Build from `master` and publish the installer, SHA-256 file, and source
-archive together under a stable tag such as `v2.0.4`. After the release is
+Build from `master`. Use `scripts/sign-windows-update.ps1` with the Tauri
+CLI and the Plus private signing key in the signing environment. Publish the
+installer, SHA-256 file, source archive, and generated `.exe.update.json`
+together under a stable tag such as `v2.0.5`. Keep the private signing key and
+its password outside Git. After the release is
 public and the installer is available, set `tag` in `releases/plus.json` on
 `master` to that tag. This file is the update channel's release pointer. Leave
 it at `null` until the first release and keep it unchanged during upstream

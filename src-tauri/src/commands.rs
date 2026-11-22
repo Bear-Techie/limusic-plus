@@ -3099,6 +3099,7 @@ pub struct PlusReleaseCheck {
 struct PlusRelease {
     version: String,
     download_url: String,
+    can_install: bool,
 }
 
 #[tauri::command]
@@ -3177,14 +3178,43 @@ pub async fn check_plus_release(app: tauri::AppHandle) -> Result<PlusReleaseChec
         .await
         .map_err(|e| e.to_string())?;
     let installer = format!("Limusic-Plus-{version}-setup-x64.exe");
+    let can_install = {
+        #[cfg(windows)]
+        {
+            let manifest = format!("{installer}.update.json");
+            crate::plus_update::can_install()
+                && latest.assets.iter().any(|asset| asset.state == "uploaded" && asset.name == manifest)
+        }
+        #[cfg(not(windows))]
+        false
+    };
     let release = (!latest.draft
         && !latest.prerelease
         && latest.assets.iter().any(|asset| asset.state == "uploaded" && asset.name == installer))
     .then(|| PlusRelease {
         version: version.to_owned(),
         download_url: format!("https://github.com/{repo}/releases/tag/{tag}"),
+        can_install,
     });
     Ok(PlusReleaseCheck { configured: true, release })
+}
+
+#[tauri::command]
+pub async fn stage_plus_update(app: tauri::AppHandle, version: String) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let repo = plus_release_repo()?.ok_or("The Plus release feed is not configured")?;
+        let selected = check_plus_release(app.clone()).await?.release;
+        if !selected.is_some_and(|release| release.can_install && release.version == version) {
+            return Err("The selected Plus release is no longer available".into());
+        }
+        crate::plus_update::stage(&app, repo, &version).await.map_err(|e| e.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (app, version);
+        Err("Plus self-updates require the Windows installer".into())
+    }
 }
 
 /// What's new, read straight from the GitHub releases API so the release description is the only

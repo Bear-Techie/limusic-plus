@@ -10,6 +10,7 @@ let networkCalls = 0;
 let plusChecks = 0;
 let plusResponse = { configured: false, release: null };
 let openedUrl = '';
+let staged;
 const { version } = JSON.parse(readFileSync(new URL('../../../src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
 const stubs = {
 	$state: (value) => value,
@@ -22,6 +23,7 @@ const stubs = {
 	canSelfUpdate: async () => false,
 	checkBetaUpdate: async () => { networkCalls++; return null; },
 	checkPlusRelease: async () => { plusChecks++; return plusResponse; },
+	stagePlusUpdate: async (version) => { staged = version; },
 	getSettings: async () => ({ update_banner: 'true', update_channel: 'beta' }),
 	openExternal: async (url) => { openedUrl = url; },
 	releaseNotes: async () => { networkCalls++; return []; },
@@ -61,6 +63,12 @@ assert.deepEqual(await updater.checkForUpdatesInteractive(), {
 	message: 'settings.about.up_to_date', error: false
 });
 assert.equal(updater.updateState.available, null);
+plusResponse.release = { version: newer, downloadUrl, canInstall: true };
+await updater.checkForUpdatesQuiet();
+assert.equal(staged, newer);
+assert.equal(updater.updateState.canInstall, true);
+assert.equal(updater.updateState.readyOnQuit, true);
+updater.updateState.available = null;
 assert.equal(networkCalls, 0, 'fork updater must not contact or install upstream releases');
 identifier = 'com.limusic.desktop';
 await updater.checkForUpdatesQuiet();

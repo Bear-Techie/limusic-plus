@@ -68,6 +68,7 @@
 		updateState,
 		availableMessage,
 		installUpdate,
+		updateActionLabel,
 		openDownloadPage,
 		checkForUpdatesQuiet,
 		QUIET_INTERVAL_MS
@@ -385,8 +386,8 @@
 			>
 				<span>{availableMessage(updateState.available)}</span>
 				{#if updateState.canInstall}
-					<Button size="sm" onclick={installUpdate} disabled={updateState.installing}>
-						{updateState.installing ? t('common.loading') : t('settings.about.install_update')}
+					<Button size="sm" onclick={installUpdate} disabled={updateState.installing || updateState.readyOnQuit}>
+						{updateActionLabel()}
 					</Button>
 				{:else}
 					<!-- Packaged build (.rpm, AUR): the updater can only rewrite an AppImage, so send them
