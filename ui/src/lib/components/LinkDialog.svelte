@@ -12,6 +12,8 @@
 	import { startRadio, toast, ui } from '$lib/player.svelte';
 	import { t } from '$lib/i18n.svelte';
 	import { isSpotifyLink, openSpotifyLink } from '$lib/import.svelte';
+	import { lt, roomInvite } from '$lib/lt.svelte';
+	import { parseRoomLink } from '$lib/room-link';
 
 	let url = $state('');
 
@@ -24,6 +26,11 @@
 
 	function submit(e: Event) {
 		e.preventDefault();
+		if (acceptRoomLink(url)) {
+			ui.linkOpen = false;
+			url = '';
+			return;
+		}
 		// A Spotify link opens its YouTube Music counterpart, or the import for a playlist (#375).
 		if (isSpotifyLink(url)) {
 			ui.linkOpen = false;
@@ -41,6 +48,15 @@
 		open(target);
 	}
 
+	function acceptRoomLink(link: string): boolean {
+		if (!parseRoomLink(link)) return false;
+		roomInvite.link = link.trim();
+		if (lt.role !== 'none' || lt.requesting) {
+			toast.info(t('dialogs.listen_together.invite_after_leaving'));
+		}
+		return true;
+	}
+
 	// The same from outside the app (#348): `limusic-app <link>`, from Rust at launch or from a
 	// second launch while this one runs. Flags ride along in argv (`--autostart`, macOS's `-psn_`),
 	// and a leading word like `open` is skipped too, since the first argument that parses wins.
@@ -48,17 +64,17 @@
 		const fromArgs = (args: string[]) => {
 			const given = args.filter((a) => !a.startsWith('-'));
 			if (!given.length) return;
+			if ([...given].reverse().some(acceptRoomLink)) return;
 			const spotify = given.find(isSpotifyLink);
 			if (spotify) return openSpotifyLink(spotify);
 			const target = given.map(parseYtLink).find((x) => x);
 			if (target) open(target);
 			else toast.error(t('dialogs.link.invalid_link'));
 		};
-		const un = onOpenLink(fromArgs);
-		takeLaunchArgs()
-			.then(fromArgs)
-			.catch(() => {});
-		return () => un.then((u) => u());
+		const drain = () => { void takeLaunchArgs().then(fromArgs).catch(() => {}); };
+		const un = onOpenLink(drain);
+		void un.then(drain, drain);
+		return () => { void un.then((u) => u(), () => {}); };
 	});
 </script>
 

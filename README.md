@@ -2,13 +2,15 @@
 
 <img src="./assets/docs/limusic-github-image.png" alt="Limusic Banner" width="100%">
 
-# Limusic
+# Limusic Plus
+
+**Limusic Plus is a fork of [SimoHypers/limusic](https://github.com/SimoHypers/limusic).**
 
 **A native desktop YouTube Music client. Rust + Tauri, ad-free, no Electron.**
 
 <p align="center">
-  <a href="https://github.com/SimoHypers/limusic/releases/latest"><img alt="GitHub Downloads" src="https://img.shields.io/github/downloads/SimoHypers/limusic/total?style=for-the-badge&label=DOWNLOADS&color=a4c400"></a>
-  <a href="https://github.com/SimoHypers/limusic/releases/latest"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/SimoHypers/limusic?display_name=release&style=for-the-badge&color=a10935"></a>
+  <a href="https://github.com/Bear-Techie/limusic-plus/releases/latest"><img alt="Limusic Plus GitHub Downloads" src="https://img.shields.io/github/downloads/Bear-Techie/limusic-plus/total?style=for-the-badge&label=DOWNLOADS&color=a4c400"></a>
+  <a href="https://github.com/Bear-Techie/limusic-plus/releases/latest"><img alt="Limusic Plus GitHub Release" src="https://img.shields.io/github/v/release/Bear-Techie/limusic-plus?display_name=release&style=for-the-badge&color=a10935"></a>
   <img alt="License" src="https://img.shields.io/github/license/SimoHypers/limusic?style=for-the-badge&color=1881cc">
   <a href="https://hosted.weblate.org/engage/limusic/"><img alt="Translation status" src="https://img.shields.io/weblate/progress/limusic?server=https%3A%2F%2Fhosted.weblate.org&style=for-the-badge&label=TRANSLATED&color=6a3fb5"></a>
   <a href="https://simohypers.github.io/limusic/"><img alt="Website" src="https://img.shields.io/badge/WEBSITE-limusic-e5486e?style=for-the-badge"></a>
@@ -29,6 +31,33 @@ YouTube Music client, and grew from there.
 </div>
 
 ---
+
+## Limusic Plus releases and privacy
+
+Limusic Plus uses its own Windows installer and release feed. When the feed is
+configured, enabling the update banner makes the app check at startup and every
+six hours until it finds an update. You can also check under **Settings → About**.
+An available update opens its GitHub release page for manual installation.
+
+The release repository contains source code and release artifacts. Keep account
+data, playback history, room state, Discord credentials, and diagnostics out of
+the repository and its releases. The update check requests public release
+metadata from GitHub without an account token, device identifier, playback or
+room data, or a telemetry payload. GitHub receives the ordinary network request.
+
+### Preparing a Windows release
+
+Run `scripts/build-windows-installer.ps1` to build with the
+[Limusic Plus release feed](https://github.com/Bear-Techie/limusic-plus/releases).
+Build from the `plus` branch and publish the installer, SHA-256 file, and source
+archive together under a stable tag such as `v2.0.4`. After the release is
+public and the installer is available, set `tag` in `releases/plus.json` on
+`plus` to that tag. This file is the update channel's release pointer. Leave
+it at `null` until the first release and keep it unchanged during upstream
+syncs and integration testing.
+To build for another public fork, pass `-ReleaseRepo owner/repo` or set
+`LIMUSIC_PLUS_RELEASE_REPO` in the build environment. Pass `-ReleaseRepo ''`
+to make a local installer with the feed disabled.
 
 ## Features
 
@@ -72,7 +101,7 @@ YouTube Music client, and grew from there.
 
 ---
 
-<h2 align="center">Download & Install</h2>
+<h2 align="center">Upstream Limusic Downloads</h2>
 
 <p align="center">
   <a href="https://github.com/SimoHypers/limusic/releases/latest">
@@ -118,6 +147,8 @@ play counts as).
 - **Discord**: click the Discord mark to toggle Rich Presence. Green dot means
   it's live. The card shows the track, artist, album art, and a progress bar, and
   it disappears when you pause.
+- **Broadcast to Discord** (Windows): play Limusic through your own bot so everyone
+  in its voice channel can listen. See [Discord voice setup](docs/DISCORD-VOICE.md).
 
 Building from source? Last.fm needs your own API credentials, and they are not in
 the repo. Get a key at [last.fm/api/account/create](https://www.last.fm/api/account/create)
@@ -161,8 +192,8 @@ entirely in some countries. Where that's the case, LRCLIB does all the work.
 ## Listen Together
 
 Synced listening with friends. Everyone streams their own audio from YouTube;
-the room only relays play/pause, seeks, track changes and the queue. One person
-hosts the relay:
+the room only relays play/pause, seeks, track changes and the queue. The app uses
+a built-in relay by default. You can also host your own:
 
 ```bash
 cargo run -p sync-server        # plain WebSocket on 0.0.0.0:8080
@@ -170,8 +201,15 @@ cargo run -p sync-server        # plain WebSocket on 0.0.0.0:8080
 
 Front it with something that terminates TLS (Tailscale Funnel, Cloudflare
 Tunnel), then paste the `wss://` URL into the Listen Together panel in the app.
-Rooms have join codes and the host approves every join and every track
-suggestion.
+Rooms have join codes and the host approves every new join. Guest track additions
+are automatically added by the host client.
+
+The Plus Windows distribution hosts on each PC automatically. Click Host to start
+the bundled relay silently; encrypted Iroh connectivity handles discovery and
+relay fallback without router setup or commands. Share an invite once, then save
+a friend's session for one-click reconnect. Host identity and room reservations
+survive restarts. The host must be online; public connection services have no
+uptime guarantee. See [saved sessions and installer](docs/SAVED-ROOMS.md).
 
 ---
 

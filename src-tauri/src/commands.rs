@@ -242,7 +242,7 @@ pub async fn get_queue(state: St<'_>) -> Result<serde_json::Value, String> {
 /// `visitor_data`) and internal blobs (`queue_json`, `queue_index`, `queue_position`) never cross
 /// into the webview: they'd otherwise ship the login credential to the renderer on every open, and
 /// the webview can't overwrite them either.
-const UI_SETTINGS: [&str; 33] = [
+const UI_SETTINGS: &[&str] = &[
     "volume",
     "proxy",
     "quality",
@@ -251,6 +251,8 @@ const UI_SETTINGS: [&str; 33] = [
     "disabled_stream_clients",
     "discord_rpc",
     "discord_rpc_config",
+    "discord_voice_channel",
+    "discord_voice_bot_id",
     "close_to_tray",
     "track_notifications",
     "track_notifications_focused",
@@ -2344,15 +2346,53 @@ async fn scan_local(state: &Arc<AppState>) -> Result<crate::local::LocalLibrary,
 
 // --- Listen Together (context/19) ----------------------------------------------------------
 
+#[tauri::command]
+pub async fn lt_save_room(state: St<'_>) -> Result<(), String> {
+    state.lt.save_room().await
+}
+
+#[tauri::command]
+pub async fn lt_open_saved(state: St<'_>, server: String, code: String) -> Result<(), String> {
+    state.lt.open_saved(server, code).await
+}
+
+#[tauri::command]
+pub async fn lt_forget_room(state: St<'_>, server: String, code: String) -> Result<(), String> {
+    state.lt.forget_room(server, code).await
+}
+
+#[tauri::command]
+pub async fn lt_update_saved_room(
+    state: St<'_>,
+    server: String,
+    code: String,
+    name: Option<String>,
+    favorite: Option<bool>,
+) -> Result<(), String> {
+    state.lt.update_saved_room(server, code, name, favorite).await
+}
+
 /// Current client-side LT state (status, role, room, participants, pending joins, suggestions).
 #[tauri::command]
 pub async fn lt_get_state(state: St<'_>) -> Result<serde_json::Value, String> {
     Ok(state.lt.snapshot().await)
 }
 
+#[tauri::command]
+pub async fn lt_check_saved_room(
+    state: St<'_>,
+    server: String,
+    code: String,
+) -> Result<String, String> {
+    Ok(state.lt.check_saved_room(server, code).await.to_string())
+}
+
 /// Set + persist the sync server URL (e.g. the Tailscale Funnel `wss://…` address).
 #[tauri::command]
 pub async fn lt_set_server_url(state: St<'_>, url: String) -> Result<(), String> {
+    if state.lt.in_room().await || state.lt.snapshot().await["requesting"] == true {
+        return Err("Leave the current room before changing servers.".into());
+    }
     let url = url.trim().to_string();
     state.db.set_setting("lt_server_url", &url);
     state.lt.set_server_url(url).await;
@@ -2360,9 +2400,12 @@ pub async fn lt_set_server_url(state: St<'_>, url: String) -> Result<(), String>
 }
 
 #[tauri::command]
-pub async fn lt_create_room(state: St<'_>, username: String) -> Result<(), String> {
-    state.lt.create_room(username).await;
-    Ok(())
+pub async fn lt_create_room(
+    state: St<'_>,
+    username: String,
+    run_local_relay: Option<bool>,
+) -> Result<(), String> {
+    state.lt.create_room(username, run_local_relay.unwrap_or(false)).await
 }
 
 #[tauri::command]
@@ -2399,6 +2442,17 @@ pub async fn lt_kick(state: St<'_>, user_id: String) -> Result<(), String> {
 pub async fn lt_transfer_host(state: St<'_>, user_id: String) -> Result<(), String> {
     state.lt.transfer_host(user_id).await;
     Ok(())
+}
+
+#[tauri::command]
+pub async fn lt_host_recovery(state: St<'_>) -> Result<(), String> {
+    let snapshot = state.lt_recovery_snapshot().await;
+    state.lt.host_recovery(snapshot).await
+}
+
+#[tauri::command]
+pub async fn lt_accept_recovery(state: St<'_>) -> Result<(), String> {
+    state.lt.accept_recovery().await
 }
 
 /// Guest: send a track to the session queue (auto-approved by the host client, which stamps
@@ -2495,11 +2549,136 @@ pub struct ReleaseNote {
     body: String,
 }
 
+fn plus_release_repo() -> Result<Option<&'static str>, String> {
+    let Some(repo) = option_env!("LIMUSIC_PLUS_RELEASE_REPO").filter(|repo| !repo.is_empty())
+    else {
+        return Ok(None);
+    };
+    let valid_segment = |s: &str| {
+        !s.is_empty()
+            && s != "."
+            && s != ".."
+            && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    };
+    if !repo.split_once('/').is_some_and(|(owner, name)| valid_segment(owner) && valid_segment(name))
+        || repo.eq_ignore_ascii_case("SimoHypers/limusic")
+    {
+        return Err("Invalid Limusic Plus release repository.".into());
+    }
+    Ok(Some(repo))
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlusReleaseCheck {
+    configured: bool,
+    release: Option<PlusRelease>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlusRelease {
+    version: String,
+    download_url: String,
+}
+
+#[tauri::command]
+pub async fn check_plus_release(app: tauri::AppHandle) -> Result<PlusReleaseCheck, String> {
+    let repo = if app.config().identifier == "com.limusic.plus" {
+        plus_release_repo()?
+    } else {
+        None
+    };
+    let Some(repo) = repo else {
+        return Ok(PlusReleaseCheck { configured: false, release: None });
+    };
+    #[derive(serde::Deserialize)]
+    struct ReleasePointer {
+        tag: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Asset {
+        name: String,
+        state: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct PublishedRelease {
+        draft: bool,
+        prerelease: bool,
+        assets: Vec<Asset>,
+    }
+    let request = |url: String| {
+        crate::http::client()
+            .get(url)
+            .header("User-Agent", "Limusic-Plus")
+            .timeout(std::time::Duration::from_secs(15))
+    };
+    let no_release = PlusReleaseCheck { configured: true, release: None };
+    let pointer = request(format!(
+        "https://raw.githubusercontent.com/{repo}/refs/heads/plus/releases/plus.json"
+    ))
+    .send()
+    .await
+    .map_err(|e| e.to_string())?;
+    if pointer.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(no_release);
+    }
+    let pointer: ReleasePointer = pointer
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(tag) = pointer.tag else {
+        return Ok(no_release);
+    };
+    let version = tag.strip_prefix('v').ok_or("Invalid Limusic Plus release tag.")?;
+    let mut parts = version.split('.');
+    let stable_version = (0..3).all(|_| {
+        parts.next().is_some_and(|part| {
+            !part.is_empty()
+                && (part == "0" || !part.starts_with('0'))
+                && part.bytes().all(|b| b.is_ascii_digit())
+                && part.parse::<u32>().is_ok()
+        })
+    }) && parts.next().is_none();
+    if !stable_version {
+        return Err("Invalid Limusic Plus release tag.".into());
+    }
+    let latest: PublishedRelease = request(format!(
+        "https://api.github.com/repos/{repo}/releases/tags/{tag}"
+    ))
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    let installer = format!("Limusic-Plus-{version}-setup-x64.exe");
+    let release = (!latest.draft
+        && !latest.prerelease
+        && latest.assets.iter().any(|asset| asset.state == "uploaded" && asset.name == installer))
+    .then(|| PlusRelease {
+        version: version.to_owned(),
+        download_url: format!("https://github.com/{repo}/releases/tag/{tag}"),
+    });
+    Ok(PlusReleaseCheck { configured: true, release })
+}
+
 /// What's new, read straight from the GitHub releases API so the release description is the only
 /// place the changelog is written. Cached for the process: the list only changes when a release
 /// is cut, and unauthenticated GitHub allows 60 requests an hour.
 #[tauri::command]
-pub async fn release_notes() -> Result<Vec<ReleaseNote>, String> {
+pub async fn release_notes(app: tauri::AppHandle) -> Result<Vec<ReleaseNote>, String> {
+    let repo = if app.config().identifier == "com.limusic.plus" {
+        let Some(repo) = plus_release_repo()? else { return Ok(Vec::new()) };
+        repo
+    } else {
+        "SimoHypers/limusic"
+    };
     static CACHE: std::sync::OnceLock<Vec<ReleaseNote>> = std::sync::OnceLock::new();
     if let Some(cached) = CACHE.get() {
         return Ok(cached.clone());
@@ -2513,8 +2692,12 @@ pub async fn release_notes() -> Result<Vec<ReleaseNote>, String> {
         prerelease: bool,
     }
     let releases: Vec<GhRelease> = crate::http::client()
-        .get("https://api.github.com/repos/SimoHypers/limusic/releases?per_page=20")
-        .header("User-Agent", concat!("Limusic/", env!("CARGO_PKG_VERSION")))
+        .get(format!("https://api.github.com/repos/{repo}/releases?per_page=20"))
+        .header("User-Agent", if repo == "SimoHypers/limusic" {
+            concat!("Limusic/", env!("CARGO_PKG_VERSION"))
+        } else {
+            "Limusic-Plus"
+        })
         .header("Accept", "application/vnd.github+json")
         .timeout(std::time::Duration::from_secs(15))
         .send()
@@ -2552,6 +2735,9 @@ pub async fn release_notes() -> Result<Vec<ReleaseNote>, String> {
 /// Reads the same `Env::appimage` the updater plugin decides on, so the two cannot disagree.
 #[tauri::command]
 pub fn can_self_update(app: tauri::AppHandle) -> bool {
+    if app.config().identifier == "com.limusic.plus" {
+        return false;
+    }
     #[cfg(target_os = "linux")]
     {
         use tauri::Manager;
@@ -2596,6 +2782,9 @@ pub struct BetaUpdate {
 pub async fn check_beta_update(webview: tauri::Webview) -> Result<Option<BetaUpdate>, String> {
     use tauri::Manager;
     use tauri_plugin_updater::UpdaterExt;
+    if webview.app_handle().config().identifier == "com.limusic.plus" {
+        return Err("Limusic Plus is updated using its own installer.".into());
+    }
     let url = tauri::Url::parse(BETA_MANIFEST).map_err(|e| e.to_string())?;
     let update = webview
         .updater_builder()

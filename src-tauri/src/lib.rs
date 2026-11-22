@@ -8,6 +8,7 @@ mod commands;
 mod db;
 mod diagnostics;
 mod discord;
+mod discord_voice;
 mod hotkeys;
 mod http;
 mod import;
@@ -551,8 +552,7 @@ const RESTARTED_ENV: &str = "LIMUSIC_RESTARTED";
 
 /// What a cold launch was given, so `limusic-app 'https://music.youtube.com/watch?v=…'` opens the
 /// link once the SPA has mounted (#348). Taken once by `take_launch_args`. A launch while we are
-/// already running reaches the single-instance callback instead, which emits `open-link`. Raw
-/// strings either way: `parseYtLink` in the UI decides what is a link, so there is one parser.
+/// already running appends to this queue before notifying the UI, including during startup.
 pub(crate) static LAUNCH_ARGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// Raised by `show_main` once the SPA has mounted, whether it shows the window or stays in the
@@ -569,9 +569,15 @@ fn should_start_minimized(db: &Db) -> bool {
         && tray::available()
 }
 
-/// Tauri entry point. Applies the platform boot fixes (open-fd limit, NVIDIA/WebKit env), restores
-/// the persisted session, wires every command and plugin, and runs the event loop. context/01
-/// §startup.
+/// Display branding follows the packaged product name without changing application identity.
+pub(crate) fn display_name(app: &tauri::AppHandle) -> &str {
+    match app.config().product_name.as_deref() {
+        Some("limusic") | None => "Limusic",
+        Some(name) => name,
+    }
+}
+
+/// Tauri entry point. Applies platform fixes, restores the session and runs the event loop.
 pub fn run() {
     // Must happen before any webview exists: the limit is inherited by the web processes WebKit
     // forks, and cannot be raised for them afterwards.
@@ -648,7 +654,7 @@ pub fn run() {
         }
     }
 
-    let mut builder = tauri::Builder::default();
+    let mut builder = tauri::Builder::default().manage(discord_voice::Broadcast::default());
 
     // Must be the first plugin registered (its documented requirement). A second launch —
     // e.g. clicking the app icon while we're hidden in the tray — re-shows this instance
@@ -665,7 +671,13 @@ pub fn run() {
             tray::show_main(app);
             // `limusic-app <link>` against this instance (#348). argv[0] leads on every platform.
             if args.len() > 1 {
-                let _ = app.emit_to("main", "open-link", &args[1..]);
+                {
+                    let mut pending = LAUNCH_ARGS.lock().unwrap();
+                    pending.extend(args.into_iter().skip(1).take(32));
+                    let excess = pending.len().saturating_sub(32);
+                    pending.drain(..excess);
+                }
+                let _ = app.emit_to("main", "open-link", ());
             }
         }));
     }
@@ -790,6 +802,7 @@ pub fn run() {
             if let Some(config) = app.config().app.windows.first() {
                 let w =
                     http::proxied(tauri::WebviewWindowBuilder::from_config(&handle, config)?)
+                        .title(display_name(&handle))
                         .build()?;
                 keep_on_screen(&w);
             }
@@ -899,7 +912,7 @@ pub fn run() {
             // Empty means the built-in default, which `LtSession` resolves when it connects. The
             // URL does not live here so that nothing ever has to hand it to the UI.
             let lt_url = db.get_setting("lt_server_url").unwrap_or_default();
-            let (lt, lt_sync_rx) = listentogether::LtSession::new(handle.clone(), lt_url);
+            let (lt, lt_sync_rx) = listentogether::LtSession::new(handle.clone(), lt_url, db.clone());
 
             let app_state = Arc::new(AppState::new(
                 it,
@@ -1155,6 +1168,17 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(only_ui(tauri::generate_handler![
+            discord_voice::voice_status,
+            discord_voice::voice_list_bots,
+            discord_voice::voice_save_bot,
+            discord_voice::voice_forget_bot,
+            discord_voice::voice_discover,
+            discord_voice::voice_apply_profile,
+            discord_voice::voice_start,
+            discord_voice::voice_stop,
+            discord_voice::voice_share_bot,
+            discord_voice::voice_bot_offers,
+            discord_voice::voice_respond_offer,
             commands::search,
             commands::search_all,
             commands::search_suggestions,
@@ -1278,6 +1302,11 @@ pub fn run() {
             commands::import_update,
             commands::import_resolve,
             commands::lt_get_state,
+            commands::lt_check_saved_room,
+            commands::lt_save_room,
+            commands::lt_open_saved,
+            commands::lt_forget_room,
+            commands::lt_update_saved_room,
             commands::lt_set_server_url,
             commands::lt_create_room,
             commands::lt_join_room,
@@ -1286,6 +1315,8 @@ pub fn run() {
             commands::lt_reject_join,
             commands::lt_kick,
             commands::lt_transfer_host,
+            commands::lt_host_recovery,
+            commands::lt_accept_recovery,
             commands::lt_suggest,
             commands::lt_approve_suggestion,
             commands::lt_reject_suggestion,
@@ -1305,6 +1336,7 @@ pub fn run() {
             commands::listenbrainz_profile,
             commands::theater_fullscreen,
             commands::release_notes,
+            commands::check_plus_release,
             commands::can_self_update,
             commands::check_beta_update,
             commands::open_external,
@@ -1315,6 +1347,11 @@ pub fn run() {
             commands::log_ui,
         ]))
         .on_window_event(|window, event| {
+            // The Windows package launcher can restore the existing HWND without
+            // starting another app process. Resume artwork updates on focus too.
+            if window.label() == "main" && matches!(event, tauri::WindowEvent::Focused(true)) {
+                tray::set_main_visible(window.app_handle(), true);
+            }
             // Close-to-tray: ✕ hides the main window and playback keeps running; real quit is
             // the tray's Quit item (or the "close_to_tray=false" setting). Label-gated: the
             // hidden cipher/PoToken webviews are windows too and must close normally.
@@ -1363,7 +1400,9 @@ pub fn run() {
             // The single place that saves positions on exit. It covers `app.exit`,
             // `request_restart`, the main window closing, and macOS Cmd+Q from the native menu.
             if let tauri::RunEvent::Exit = &event {
+                handle.state::<discord_voice::Broadcast>().stop();
                 if let Some(state) = handle.try_state::<Arc<AppState>>() {
+                    state.lt.stop_local_relay();
                     state.flush_position();
                 }
                 mini::save_position(handle);

@@ -1,0 +1,6 @@
+{
+  "productName": "Limusic Plus",
+  "identifier": "com.limusic.plus",
+  "bundle": { "createUpdaterArtifacts": false },
+  "plugins": { "updater": { "endpoints": [] } }
+}

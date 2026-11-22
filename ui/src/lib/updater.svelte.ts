@@ -7,9 +7,9 @@ import { relaunch } from '@tauri-apps/plugin-process';
 import { toast } from './player.svelte';
 import { t } from './i18n.svelte';
 import { friendlyNetError } from './neterr';
-import { canSelfUpdate, checkBetaUpdate, getSettings, openExternal, releaseNotes } from './api';
+import { canSelfUpdate, checkBetaUpdate, checkPlusRelease, getSettings, openExternal, releaseNotes } from './api';
 import { isNewer, isPrerelease } from './version';
-import { getVersion } from '@tauri-apps/api/app';
+import { getIdentifier, getVersion } from '@tauri-apps/api/app';
 
 const RELEASES_URL = 'https://github.com/SimoHypers/limusic/releases/latest';
 
@@ -19,7 +19,7 @@ export const QUIET_INTERVAL_MS = 6 * 60 * 60 * 1000;
 export const updateState = $state({
 	// Set when Latest differs from this build. `rollback` is true when Latest is OLDER than this
 	// build, which is what a pulled release looks like from the inside (see `look()`).
-	available: null as { version: string; rollback: boolean } | null,
+	available: null as { version: string; rollback: boolean; downloadUrl?: string } | null,
 	canInstall: true, // false on packaged Linux builds; always resolved before `available` is set
 	checking: false, // Settings "Check for updates" is in flight
 	installing: false // downloading/installing the update
@@ -28,7 +28,18 @@ export const updateState = $state({
 // The resolved handle to download; kept out of reactive state (it's not serializable/renderable).
 let pending: Update | null = null;
 
-async function look(): Promise<boolean> {
+async function look(): Promise<boolean | 'unconfigured'> {
+	if ((await getIdentifier()) === 'com.limusic.plus') {
+		const { configured, release } = await checkPlusRelease();
+		if (!configured) return 'unconfigured';
+		if (!release || !isNewer(release.version, await getVersion())) {
+			updateState.available = null;
+			return false;
+		}
+		updateState.canInstall = false;
+		updateState.available = { ...release, rollback: false };
+		return true;
+	}
 	let u: Update | null;
 	const beta = (await getSettings()).update_channel === 'beta';
 	const current = await getVersion();
@@ -133,7 +144,9 @@ export async function recheckForUpdates() {
 export async function checkForUpdatesInteractive(): Promise<{ message: string; error: boolean }> {
 	updateState.checking = true;
 	try {
-		if (await look()) return { message: availableMessage(updateState.available!), error: false };
+		const result = await look();
+		if (result === 'unconfigured') return { message: t('settings.about.plus_installer_updates'), error: false };
+		if (result) return { message: availableMessage(updateState.available!), error: false };
 		return { message: t('settings.about.up_to_date'), error: false };
 	} catch (e) {
 		// Rendered inline in the dialog rather than as a toast, so it misses the toast's own
@@ -147,8 +160,17 @@ export async function checkForUpdatesInteractive(): Promise<{ message: string; e
 
 /** Send a packaged build to the releases page. Their package manager does the actual updating; all
  *  the app can do is say a new version exists and get out of the way. */
-export function openDownloadPage() {
-	openExternal(RELEASES_URL).catch((e) => toast.error(t('toasts.browser_failed', { error: String(e) })));
+export async function openDownloadPage() {
+	try {
+		const url = updateState.available?.downloadUrl;
+		if (url) {
+			await openExternal(url);
+		} else if ((await getIdentifier()) !== 'com.limusic.plus') {
+			await openExternal(RELEASES_URL);
+		}
+	} catch (e) {
+		toast.error(t('toasts.browser_failed', { error: String(e) }));
+	}
 }
 
 /** Download + install the pending update, then relaunch into the new version. */
@@ -159,7 +181,7 @@ export async function installUpdate() {
 		// Re-read the manifest first. A banner can sit on screen for hours, and an installer replaced
 		// in place since then no longer matches the signature it was offered with, so the plugin
 		// refuses it (#436, 1.2.0's Windows swap). `look` swaps `pending` for the current one.
-		if (!(await look())) {
+		if ((await look()) !== true) {
 			updateState.available = null;
 			updateState.installing = false;
 			return;

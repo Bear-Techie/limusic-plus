@@ -1216,7 +1216,7 @@ export const ui = $state({
 	toast: null as Toast | null,
 	settingsOpen: false, // the settings modal
 	tempoPitchOpen: false, // playback effects stay open when the current track menu is replaced
-	settingsFocus: null as 'lyrics' | 'scrobbling' | null, // a section to open settings on, once
+	settingsFocus: null as 'lyrics' | 'scrobbling' | 'discord' | null, // a section to open settings on, once
 	scrobbleTrack: null as SongItem | null, // "Edit scrobble" from a track menu: the track to edit
 	ltOpen: false, // the Listen Together modal
 	linkOpen: false, // the "open a pasted link" modal

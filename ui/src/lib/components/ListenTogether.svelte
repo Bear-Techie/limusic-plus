@@ -1,7 +1,11 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
 	import * as Dialog from '$lib/components/ui/dialog';
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
+	import SavedRooms from '$lib/components/SavedRooms.svelte';
+	import RoomRecovery from '$lib/components/RoomRecovery.svelte';
+	import RoomShareBot from '$lib/components/RoomShareBot.svelte';
 	import { HugeiconsIcon } from '@hugeicons/svelte';
 	import {
 		Copy01Icon,
@@ -19,7 +23,8 @@
 	import * as api from '$lib/api';
 	import { copyText } from '$lib/clipboard';
 	import { ui, toast } from '$lib/player.svelte';
-	import { lt } from '$lib/lt.svelte';
+	import { lt, roomInvite } from '$lib/lt.svelte';
+	import { makeRoomLink, parseRoomLink } from '$lib/room-link';
 	import { t } from '$lib/i18n.svelte';
 
 	let mode = $state<'join' | 'host'>('join');
@@ -28,17 +33,31 @@
 	let showServer = $state(false);
 	let inviteInput = $state('');
 	let busy = $state(false);
+	let leaving = $state(false);
 	let copied = $state(false);
+	let manageSaved = $state(false);
+	let recoveryAnnounced = $state('');
+
+	// This lives outside Dialog.Content so it runs even while the dialog is closed.
+	$effect(() => {
+		const key = lt.recoveryDisconnected
+			? `${lt.roomCode ?? 'lost'}:${lt.recoveryInviter ?? 'waiting'}` : '';
+		if (key && key !== recoveryAnnounced) ui.ltOpen = true;
+		recoveryAnnounced = key;
+	});
 
 	// Seed inputs when the modal opens: remembered name + the persisted server URL. `serverUrl` is
 	// empty on the default server, which is the whole point: the address only appears once the user
 	// opens the panel below and asks for it.
 	$effect(() => {
 		if (ui.ltOpen) {
-			name = localStorage.getItem('lt_name') ?? '';
-			serverUrl = lt.serverUrl;
-			showServer = false;
-			copied = false;
+			untrack(() => {
+				name = localStorage.getItem('lt_name') ?? '';
+				serverUrl = lt.serverUrl;
+				showServer = false;
+				copied = false;
+				manageSaved = false;
+			});
 		}
 	});
 
@@ -48,6 +67,8 @@
 	// What a guest has to be sent. On the default server that is the bare room code and nothing
 	// else; a self-hosted room has to carry its address or the code means nothing.
 	const invite = $derived(makeInvite(lt.serverUrl, lt.roomCode ?? ''));
+	const inviteLink = $derived(isHost && lt.peerHosting && lt.status === 'connected'
+		? makeRoomLink(lt.serverUrl, lt.roomCode ?? '') : null);
 	// Sitting between "asked to join" and "in the room" — show a waiting state, block re-sends.
 	const waiting = $derived(lt.requesting && lt.role === 'none');
 	const statusLabel = $derived(
@@ -58,6 +79,18 @@
 				: t('dialogs.listen_together.status_disconnected')
 	);
 	const others = $derived(lt.users.filter((u) => u.user_id !== lt.myId).length);
+	const currentSaved = $derived(lt.savedRooms.find((room) => room.roomCode === lt.roomCode && room.serverUrl === (lt.serverUrl || lt.defaultServerUrl)));
+	const savedScope = $derived(inRoom ? (isHost ? 'host' : 'join') : mode);
+	const visibleSavedRooms = $derived(lt.savedRooms.filter((room) => room.owner === (savedScope === 'host')));
+
+	$effect(() => {
+		const link = roomInvite.link;
+		if (!link || inRoom || waiting || leaving) return;
+		roomInvite.link = '';
+		mode = 'join';
+		inviteInput = link;
+		ui.ltOpen = true;
+	});
 
 	function rememberName() {
 		localStorage.setItem('lt_name', name.trim());
@@ -74,10 +107,12 @@
 	// bare code: a host on the default never shares a hostname, and a guest never types one.
 	function makeInvite(server: string, code: string): string {
 		if (!server) return code;
+		if (server.startsWith('limusic-peer://')) return 'LMSC~' + btoa(server + '|' + code);
 		return code + '@' + server.replace(/^wss:\/\//, '').replace(/\/ws$/, '');
 	}
 	function parseInvite(raw: string): { server: string; code: string } | null {
 		const s = raw.trim();
+		if (/^limusic-plus:/i.test(s)) return parseRoomLink(s);
 		// Invites minted before 0.6.5: `LMSC~<base64(server|code)>`.
 		if (s.startsWith('LMSC~')) {
 			try {
@@ -118,6 +153,8 @@
 			if (u !== lt.serverUrl) await api.ltSetServerUrl(u);
 			rememberName();
 			await api.ltCreateRoom(name.trim());
+		} catch (e) {
+			toast.error(String(e));
 		} finally {
 			busy = false;
 		}
@@ -136,13 +173,43 @@
 			if (server !== lt.serverUrl) await api.ltSetServerUrl(server);
 			rememberName();
 			await api.ltJoinRoom(parsed.code, name.trim());
+		} catch (error) {
+			toast.error(String(error));
 		} finally {
 			busy = false;
 		}
 	}
 
 	async function leave() {
-		await api.ltLeave();
+		if (leaving) return;
+		leaving = true;
+		try {
+			await api.ltLeave();
+			ui.ltOpen = false;
+		} catch (error) {
+			toast.error(String(error));
+		} finally {
+			leaving = false;
+		}
+	}
+
+	async function reconnect(server: string, code: string) {
+		busy = true;
+		try {
+			await api.ltOpenSaved(server, code);
+		} catch (e) {
+			toast.error(String(e));
+		} finally {
+			busy = false;
+		}
+	}
+
+	async function saveRoom() {
+		try {
+			await api.ltSaveRoom();
+		} catch (e) {
+			toast.error(String(e));
+		}
 	}
 
 	function copyInvite() {
@@ -154,10 +221,18 @@
 			() => toast.error(t('dialogs.listen_together.invite_copy_failed'))
 		);
 	}
+
+	function copyInviteLink() {
+		if (!inviteLink) return;
+		void copyText(inviteLink).then(
+			() => toast.success(t('dialogs.listen_together.copied_link')),
+			() => toast.error(t('dialogs.listen_together.invite_copy_failed'))
+		);
+	}
 </script>
 
 <Dialog.Root bind:open={ui.ltOpen}>
-	<Dialog.Content class="gap-0 overflow-hidden sm:max-w-md">
+	<Dialog.Content class="max-h-[85dvh] gap-0 overflow-y-auto sm:max-w-md">
 		<Dialog.Header class="gap-1">
 			<Dialog.Title class="flex items-center gap-2">
 				<HugeiconsIcon icon={UserGroupIcon} class="h-5 w-5 text-primary" />
@@ -169,6 +244,7 @@
 					: t('dialogs.listen_together.subtitle')}
 			</Dialog.Description>
 		</Dialog.Header>
+		<RoomRecovery />
 
 		{#if waiting}
 			<!-- Asked to join / creating — waiting on the room. -->
@@ -179,9 +255,12 @@
 						? t('dialogs.listen_together.connecting')
 						: t('dialogs.listen_together.waiting_for_host')}
 				</p>
-				<Button variant="ghost" size="sm" onclick={leave}>{t('common.cancel')}</Button>
+				<Button variant="ghost" size="sm" disabled={leaving} onclick={leave}>{t('common.cancel')}</Button>
 			</div>
 		{:else if !inRoom}
+			{#if lt.savedRoomsError}
+				<p class="pt-5 text-sm text-destructive">{t('dialogs.listen_together.saved_load_error')}</p>
+			{/if}
 			<!-- Setup: join with a code, or open a room of your own. -->
 			<div class="flex min-w-0 flex-col gap-5 pt-5">
 				<div class="flex rounded-full bg-muted p-1 text-sm">
@@ -202,6 +281,9 @@
 				</div>
 
 				<!-- Both paths need a name, so it is asked once, above the split. -->
+				{#if visibleSavedRooms.length}
+					<SavedRooms rooms={visibleSavedRooms} scope={savedScope} active={ui.ltOpen} {busy} {reconnect} />
+				{/if}
 				<div class="flex flex-col gap-1.5">
 					<label class="text-xs font-medium text-muted-foreground" for="lt-name">
 						{t('dialogs.listen_together.your_name')}
@@ -241,7 +323,7 @@
 						<div class="flex gap-3 rounded-2xl border bg-muted/40 p-3.5">
 							<HugeiconsIcon icon={PlusSignIcon} class="mt-0.5 h-4 w-4 shrink-0 text-primary" />
 							<p class="text-xs leading-relaxed text-muted-foreground">
-								{t('dialogs.listen_together.host_blurb')}
+								{t(lt.peerHosting ? 'dialogs.listen_together.peer_host_blurb' : 'dialogs.listen_together.host_blurb')}
 							</p>
 						</div>
 						<Button type="submit" class="w-full" disabled={busy}>
@@ -250,6 +332,7 @@
 
 						<!-- The server address lives behind this, and nowhere else. Almost nobody runs
 						     one, so the default path never shows a URL at all. -->
+						{#if !lt.peerHosting}
 						<div class="border-t pt-3">
 							<button
 								type="button"
@@ -290,6 +373,7 @@
 								</div>
 							{/if}
 						</div>
+						{/if}
 					</form>
 				{/if}
 			</div>
@@ -318,12 +402,6 @@
 					<div class="mt-3 select-all pl-[0.3em] font-mono text-3xl font-semibold tracking-[0.3em]">
 						{lt.roomCode ?? '······'}
 					</div>
-					{#if onCustomServer}
-						<div class="mt-1.5 select-all truncate font-mono text-[11px] text-muted-foreground">
-							{invite}
-						</div>
-					{/if}
-
 					<Button variant="outline" size="sm" class="mt-4 w-full" onclick={copyInvite}>
 						<!-- icon swap via altIcon/showAlt: `icon` is frozen at mount -->
 						<HugeiconsIcon icon={Copy01Icon} altIcon={Tick02Icon} showAlt={copied} class="h-4 w-4" />
@@ -333,12 +411,28 @@
 								? t('dialogs.listen_together.copy_invite')
 								: t('dialogs.listen_together.copy_code')}
 					</Button>
+					{#if inviteLink}
+						<Button variant="outline" size="sm" class="mt-2 w-full" onclick={copyInviteLink}>
+							{t('dialogs.listen_together.copy_invite_link')}
+						</Button>
+					{/if}
 					<p class="mt-2 text-xs text-muted-foreground">
 						{t('dialogs.listen_together.share_hint')}
 					</p>
 				</div>
 
 				<!-- Now playing -->
+				{#if isHost || lt.savedRoom}
+					<Button variant={currentSaved ? 'secondary' : 'outline'} size="sm" disabled={lt.status !== 'connected' || !!currentSaved} onclick={saveRoom}>
+						{#if currentSaved}<HugeiconsIcon icon={Tick02Icon} class="h-4 w-4 text-green-600" />{/if}
+						{t(currentSaved ? 'dialogs.listen_together.saved' : 'dialogs.listen_together.save_room')}
+					</Button>
+					{#if currentSaved}<p role="status" class="text-center text-xs text-muted-foreground">{t('dialogs.listen_together.saved_current_hint')}</p>{/if}
+				{/if}
+				{#if visibleSavedRooms.length}
+					<Button variant="ghost" size="sm" aria-expanded={manageSaved} onclick={() => (manageSaved = !manageSaved)}>{t('dialogs.listen_together.manage_saved')}</Button>
+					{#if manageSaved}<SavedRooms rooms={visibleSavedRooms} scope={savedScope} active={ui.ltOpen} {busy} {reconnect} showReconnect={false} />{/if}
+				{/if}
 				{#if lt.currentTrack}
 					<div class="flex min-w-0 items-center gap-3 px-1">
 						{#if lt.currentTrack.thumbnail}
@@ -389,6 +483,9 @@
 						<div class="mb-2 text-xs font-medium text-muted-foreground">
 							{t('dialogs.listen_together.in_room', { count: lt.users.length })}
 						</div>
+						{#if isHost && lt.status === 'connected' && lt.serverUrl.startsWith('limusic-peer://') && lt.users.some((u) => u.user_id !== lt.myId && u.is_connected)}
+							<RoomShareBot />
+						{/if}
 						<div class="flex flex-col gap-0.5">
 							{#each lt.users as u (u.user_id)}
 								<div class="group flex min-w-0 items-center gap-2.5 rounded-lg py-1">
@@ -484,7 +581,7 @@
 						</Button>
 					{/if}
 					<div class="flex-1"></div>
-					<Button variant="destructive" size="sm" onclick={leave}>
+					<Button variant="destructive" size="sm" disabled={leaving} onclick={leave}>
 						<HugeiconsIcon icon={Logout01Icon} class="h-4 w-4" />
 						{t('dialogs.listen_together.leave')}
 					</Button>

@@ -2,7 +2,18 @@
 // button read this; mutations go through `api` commands. context/19.
 import type { LtState } from './api';
 
+export const roomInvite = $state({ link: '' });
+
 export const lt = $state<LtState>({
+    recoveryDisconnected: false,
+    recoveryInviter: null,
+    recoveryBusy: false,
+	localRelayAvailable: false,
+	localRelayRunning: false,
+	peerHosting: false,
+	savedRoom: false,
+	savedRoomsError: false,
+	savedRooms: [],
 	status: 'disconnected',
 	role: 'none',
 	requesting: false,

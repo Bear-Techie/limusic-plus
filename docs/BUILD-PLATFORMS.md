@@ -12,7 +12,7 @@ auto-merges the platform file over the base for the current OS.
 
 ## Common prerequisites (all platforms)
 
-- **Rust** (stable, via rustup) and the Tauri CLI: `cargo install tauri-cli --version "^2"`.
+- **Rust 1.91 or newer** (stable, via rustup) and the Tauri CLI: `cargo install tauri-cli --version "^2"`.
 - **Node + pnpm**, then install the UI deps once: `cd ui && pnpm install`.
 - Build command everywhere: `cd ui && pnpm build` then `cargo tauri build` (the config's
   `beforeBuildCommand` also runs `pnpm build`, but running it first makes failures obvious).
@@ -70,10 +70,14 @@ cargo tauri build --bundles deb   # → target/release/bundle/deb/limusic_*.deb
 
 1. **Toolchain:** Rust with the **MSVC** toolchain (`rustup default stable-msvc`), the VS Build
    Tools (C++), Node/pnpm. WebView2 ships with Windows 10/11 (else install the Evergreen runtime).
-2. **libmpv dev files:** download a prebuilt **libmpv dev** package — the shinchiro
-   `mpv-dev-x86_64-*.7z` builds ([releases](https://github.com/shinchiro/mpv-winbuild-cmake/releases);
-   take the plain `x86_64`, **not** `-v3-`, which requires AVX2). It contains `libmpv-2.dll`, a
-   MinGW import lib (`libmpv.dll.a`), and headers — **no `.def` and no `mpv.lib`**.
+2. **libmpv:** use the package pinned by `.github/workflows/windows-release.yml`,
+   including its SHA256 check. The current pin is
+   [libmpv-2-x86_64-20260610-git-304426c.7z](https://github.com/SimoHypers/limusic/releases/download/deps/libmpv-2-x86_64-20260610-git-304426c.7z),
+   SHA256 `af708edcdf6ed12ac7b2bb31b4cbeba0bf7d4eef345a715ef5de782c0ddd6671`.
+   Extract it into a local directory such as `.build-tools/mpv` (Windows `tar.exe -xf`
+   can extract this archive). It contains `libmpv-2.dll`; generate the MSVC import
+   library below. Later upstream builds may require extra GPU-driver DLLs; use the
+   CI pin for reproducible builds. Avoid `-v3-` builds, which require AVX2.
 3. **Build an MSVC import library.** The MSVC linker cannot consume MinGW's `libmpv.dll.a`, so
    synthesise a `.def` from the DLL's export table and turn it into `mpv.lib` (from a *Developer*
    PowerShell, so `dumpbin`/`lib` are on PATH):
@@ -86,10 +90,16 @@ cargo tauri build --bundles deb   # → target/release/bundle/deb/limusic_*.deb
    ```
    (The Rust side only emits `cargo:rustc-link-lib=mpv` — pregenerated bindings, so the headers
    aren't needed at build time.)
-4. **Point the linker at it:** `$env:RUSTFLAGS = "-L native=C:\path\to\libmpv"` (or, to keep it
-   set for every build, `%USERPROFILE%\.cargo\config.toml` →
-   `[build] rustflags = ["-L", "C:\\path\\to\\libmpv"]`). This config is machine-specific, so it
-   lives in the user-level Cargo config, never in the repo.
+4. **Point the linker at it.** From the repository root, these session-only
+   settings also handle checkout paths containing spaces:
+   ```powershell
+   $mpvDir = (Resolve-Path '.build-tools/mpv').Path
+   $env:CARGO_ENCODED_RUSTFLAGS = '-L' + [char]31 + ('native=' + $mpvDir)
+   $env:Path = $mpvDir + ';' + $env:Path
+   ```
+   The PATH entry lets test binaries and `cargo run` load the DLL. For a persistent
+   linker setting, use the user-level Cargo config, never the repo:
+   `[build] rustflags = ["-L", "native=C:\\path\\to\\libmpv"]`.
 5. **Bundle the DLL:** copy `libmpv-2.dll` into `src-tauri/` (it is listed under
    `tauri.windows.conf.json` → `bundle.resources`, so the installer places it next to the exe).
    It's ~117 MB — gitignored, never commit it.
@@ -100,6 +110,68 @@ cargo tauri build --bundles deb   # → target/release/bundle/deb/limusic_*.deb
    ```
 - Media keys use **SMTC** (the volume-flyout media card). souvlaki binds it to the main window
   handle — see the validation checklist below.
+
+For a new Windows development machine, install these packages from PowerShell,
+then reopen the terminal so PATH changes take effect:
+
+```powershell
+winget install --id Microsoft.VisualStudio.2022.BuildTools --exact --override "--wait --quiet --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+winget install --id Rustlang.Rustup --exact
+winget install --id OpenJS.NodeJS.LTS --exact
+npm install -g pnpm@10
+rustup default stable-msvc
+cargo install tauri-cli --version '^2' --locked
+```
+
+The C++ workload must include MSVC x64/x86 tools and a Windows SDK. Verify the
+WebView2 Evergreen runtime is installed. See the official
+[Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) and
+[Microsoft Rust setup guide](https://learn.microsoft.com/en-us/windows/dev-environment/rust/setup).
+Run `pnpm install --frozen-lockfile` inside `ui`, prepare libmpv as above, then
+run `cargo test --all` and the frontend checks in `CONTRIBUTING.md` before building.
+Last.fm credentials are optional; the README explains their setup.
+
+If Windows desktop **tests** exit before running with `0xc0000139`
+(`STATUS_ENTRYPOINT_NOT_FOUND`), check whether the test executable is missing the
+Common Controls v6 manifest. The normal app build has resources, but the Rust
+test harness can lack them while importing `TaskDialogIndirect`. For local tests,
+build the harnesses first, then embed the dependency using the Windows SDK's
+`mt.exe` from Developer PowerShell:
+
+```powershell
+$artifacts = cargo test --all --no-run --message-format=json
+if ($LASTEXITCODE -ne 0) { throw 'Test build failed' }
+@'
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency><dependentAssembly>
+    <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls"
+      version="6.0.0.0" processorArchitecture="*"
+      publicKeyToken="6595b64144ccf1df" language="*" />
+  </dependentAssembly></dependency>
+</assembly>
+'@ | Set-Content target/test.manifest -Encoding utf8
+$testManifest = (Resolve-Path target/test.manifest).Path
+$tests = $artifacts | ForEach-Object { $_ | ConvertFrom-Json } |
+  Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.executable }
+foreach ($test in $tests) {
+  if ((Split-Path $test.executable -Leaf) -match '^(app_lib|limusic_app)-') {
+    mt.exe -nologo -manifest $testManifest "-outputresource:$($test.executable);#1"
+    if ($LASTEXITCODE -ne 0) { throw 'Manifest embedding failed' }
+  }
+  Push-Location (Split-Path $test.manifest_path)
+  try {
+    & $test.executable
+    if ($LASTEXITCODE -ne 0) { throw "Test failed: $($test.executable)" }
+  } finally { Pop-Location }
+}
+```
+
+This runs every generated unit/integration test binary, changing only local test
+executables. Run doctests separately with `cargo test --all --doc`. Invoking Cargo
+again to run the harness can relink it and remove the manifest; invoke the built
+test executables directly as above. Repeat after a relink. This is not a
+replacement for diagnosing other DLL errors.
 
 ---
 

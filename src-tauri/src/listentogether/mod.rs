@@ -7,6 +7,13 @@
 //! No back-reference to `AppState` (avoids an Arc cycle): everything the connection needs is the
 //! `AppHandle` (to emit UI events) and the sync channel.
 
+pub(crate) mod bot_share;
+mod local_relay;
+mod peer;
+mod recovery;
+mod recovery_session;
+use recovery_session::{RecoveryContext, RecoveryInvitation, RecoveryTransition};
+
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -93,6 +100,13 @@ const DEFAULT_SERVER: &str = "wss://fedora-1.tail9c4985.ts.net/ws";
 
 #[derive(Default)]
 struct Inner {
+    recovery_disconnected: bool,
+    recovery_inviter: Option<String>,
+    recovery_busy: bool,
+    hosted_relay_port: Option<u16>,
+    supports_saved_rooms: bool,
+    unsaved_owner_token: Option<String>,
+    saved_room: bool,
     status_connected: bool,
     connecting: bool,
     /// We've asked to create/join and are waiting for the room to materialize (host approval).
@@ -131,6 +145,9 @@ impl Inner {
     /// Clear all room membership (leave / kicked / fatal). Keeps `server_url`.
     fn reset_room(&mut self) {
         self.role = Role::None;
+        self.hosted_relay_port = None;
+        self.unsaved_owner_token = None;
+        self.saved_room = false;
         self.room_code = None;
         self.my_id = None;
         self.session_token = None;
@@ -146,6 +163,8 @@ impl Inner {
     }
 
     fn absorb(&mut self, state: &RoomState) {
+        self.supports_saved_rooms = state.supports_saved_rooms;
+        self.saved_room = state.saved;
         self.room_code = Some(state.room_code.clone());
         self.users = state.users.clone();
         self.current_track = state.current_track.clone();
@@ -154,6 +173,17 @@ impl Inner {
 }
 
 pub struct LtSession {
+    recovery: recovery::RecoveryNetwork,
+    recovery_context: Mutex<Option<RecoveryContext>>,
+    recovery_invitation: Mutex<Option<RecoveryInvitation>>,
+    recovery_transition: Mutex<Option<RecoveryTransition>>,
+    recovery_action: Mutex<()>,
+    peer: peer::PeerNetwork,
+    local_relay: Arc<local_relay::LocalRelay>,
+    db: Arc<crate::db::Db>,
+    saved: Mutex<Vec<SavedRoom>>,
+    saved_load_error: Option<String>,
+    hosting_action: Mutex<()>,
     app: AppHandle,
     inner: Arc<Mutex<Inner>>,
     sync_tx: mpsc::UnboundedSender<SyncCommand>,
@@ -161,26 +191,464 @@ pub struct LtSession {
     gen: AtomicU64,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct SavedRoom {
+    #[serde(default)]
+    recovery_room: bool,
+    #[serde(default)]
+    last_used_ms: i64,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    favorite: bool,
+    #[serde(default)]
+    host_name: String,
+    #[serde(default)]
+    local_relay_port: Option<u16>,
+    server_url: String,
+    room_code: String,
+    username: String,
+    owner_token: Option<String>,
+}
+
+impl SavedRoom {
+    fn relay_to_start(&self) -> Option<u16> {
+        self.local_relay_port.or_else(|| {
+            self.owner_token.as_ref().and_then(|_| local_relay::loopback_port(&self.server_url))
+        })
+    }
+
+    fn view(&self) -> serde_json::Value {
+        serde_json::json!({
+            "serverUrl": self.server_url, "roomCode": self.room_code,
+            "username": self.username, "owner": self.owner_token.is_some(),
+            "hostName": self.host_name,
+            "name": self.name, "favorite": self.favorite,
+            "lastUsedMs": self.last_used_ms,
+        })
+    }
+}
+
+fn upsert_saved_room(saved: &mut Vec<SavedRoom>, record: SavedRoom) {
+    if let Some(old) = saved
+        .iter_mut()
+        .find(|r| r.server_url == record.server_url && r.room_code == record.room_code)
+    {
+        let port = record.local_relay_port.or(old.local_relay_port);
+        let host_name =
+            if old.host_name.is_empty() { record.host_name.clone() } else { old.host_name.clone() };
+        let token = record.owner_token.or_else(|| old.owner_token.clone());
+        *old = SavedRoom {
+            recovery_room: old.recovery_room || record.recovery_room,
+            last_used_ms: old.last_used_ms.max(record.last_used_ms),
+            name: old.name.clone(),
+            favorite: old.favorite,
+            owner_token: token,
+            local_relay_port: port,
+            host_name,
+            ..record
+        };
+    } else {
+        saved.push(record);
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct GuestPass {
+    server_url: String,
+    room_code: String,
+    token: String,
+}
+
+fn canonical_server(url: &str) -> &str {
+    if url.is_empty() {
+        DEFAULT_SERVER
+    } else {
+        url
+    }
+}
+
+fn guest_pass(db: &crate::db::Db, server: &str, code: &str) -> Option<String> {
+    let records: Vec<GuestPass> = serde_json::from_str(&db.get_setting("lt_guest_passes")?).ok()?;
+    records
+        .into_iter()
+        .find(|r| r.server_url == canonical_server(server) && r.room_code == code)
+        .map(|r| r.token)
+}
+
+fn remember_guest_pass(
+    db: &crate::db::Db,
+    server: &str,
+    code: &str,
+    token: String,
+) -> Result<(), String> {
+    let mut records: Vec<GuestPass> = db
+        .get_setting("lt_guest_passes")
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|_| {
+                "Saved guest permissions could not be read; existing data was kept.".to_string()
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let server_url = canonical_server(server).to_string();
+    records.retain(|r| r.server_url != server_url || r.room_code != code);
+    records.push(GuestPass { server_url, room_code: code.to_string(), token });
+    db.set_setting_checked(
+        "lt_guest_passes",
+        &serde_json::to_string(&records).map_err(|e| e.to_string())?,
+    )
+}
+
+fn load_saved_rooms(db: &crate::db::Db) -> Result<Vec<SavedRoom>, String> {
+    db.get_setting("lt_saved_rooms")
+        .map(|s| {
+            let records: Vec<SavedRoom> = serde_json::from_str(&s).map_err(|e| e.to_string())?;
+            let mut hosts = Vec::new();
+            for record in records {
+                upsert_saved_room(&mut hosts, record);
+            }
+            Ok(hosts)
+        })
+        .unwrap_or_else(|| Ok(Vec::new()))
+}
+
+// Keep the normal Host destination independent of shortcuts and recovery rooms.
+// Never replace a damaged or mismatched identity by silently creating another room.
+fn own_room(
+    db: &crate::db::Db,
+    saved: &[SavedRoom],
+    address: &str,
+) -> Result<Option<SavedRoom>, String> {
+    if let Some(json) = db.get_setting("lt_own_room") {
+        let room: SavedRoom = serde_json::from_str(&json)
+            .map_err(|_| "Your own room could not be read. Restore your app data backup.")?;
+        if room.server_url != address || room.owner_token.is_none() {
+            return Err("Your own room does not match this hosting identity. Restore your app data backup.".into());
+        }
+        return Ok(Some(room));
+    }
+    // Older installations kept ownership only in the saved list. Its first owned
+    // room is the original; later recovery rooms must not take its place.
+    let room = saved
+        .iter()
+        .find(|r| r.server_url == address && r.owner_token.is_some() && !r.recovery_room)
+        .cloned();
+    if let Some(room) = &room {
+        db.set_setting_checked(
+            "lt_own_room",
+            &serde_json::to_string(room).map_err(|e| e.to_string())?,
+        )?;
+    }
+    Ok(room)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+async fn probe_room(socket: &mut peer::Socket, code: &str) -> Result<bool, String> {
+    socket
+        .send(Message::Text(ClientMessage::CheckRoom { room_code: code.to_string() }.to_json()))
+        .await
+        .map_err(|e| e.to_string())?;
+    while let Some(frame) = socket.next().await {
+        let frame = frame.map_err(|e| e.to_string())?;
+        if let Message::Text(text) = frame {
+            match serde_json::from_str::<ServerMessage>(&text).map_err(|e| e.to_string())? {
+                ServerMessage::RoomAvailability { room_code, open } if room_code == code => {
+                    return Ok(open)
+                }
+                ServerMessage::Pong => {}
+                _ => return Err("Relay does not support availability checks".into()),
+            }
+        }
+    }
+    Err("Connection closed during availability check".into())
+}
+
 impl LtSession {
     /// Create the session. Returns the receiver the bridge task drains to drive guest playback.
     pub fn new(
         app: AppHandle,
         server_url: String,
+        db: Arc<crate::db::Db>,
     ) -> (Arc<Self>, mpsc::UnboundedReceiver<SyncCommand>) {
         // rustls needs a process-wide crypto provider before the first `wss://` handshake.
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (sync_tx, sync_rx) = mpsc::unbounded_channel();
         let inner = Inner { server_url, ..Inner::default() };
+        let loaded = load_saved_rooms(&db);
+        let saved_load_error = loaded.as_ref().err().cloned();
         let s = Arc::new(LtSession {
+            recovery: recovery::RecoveryNetwork::default(),
+            recovery_context: Mutex::new(None),
+            recovery_invitation: Mutex::new(None),
+            recovery_transition: Mutex::new(None),
+            recovery_action: Mutex::new(()),
+            peer: peer::PeerNetwork::new(db.clone()),
+            local_relay: Arc::new(local_relay::LocalRelay::bundled()),
+            saved: Mutex::new(loaded.unwrap_or_default()),
+            saved_load_error,
+            hosting_action: Mutex::new(()),
+            db,
             app,
             inner: Arc::new(Mutex::new(inner)),
             sync_tx,
             gen: AtomicU64::new(0),
         });
+        let weak = Arc::downgrade(&s);
+        tauri::async_runtime::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let Some(session) = weak.upgrade() else { break };
+                session.recovery_tick().await;
+            }
+        });
         (s, sync_rx)
     }
 
     // --- public API (called by commands + AppState) -----------------------------------------
+
+    async fn remember_room(&self, owner_token: Option<String>) -> Result<(), String> {
+        if self.saved_load_error.is_some() {
+            return Err("Saved room data could not be read; repair it before saving.".into());
+        }
+        let recovery_room = matches!(
+            *self.recovery_transition.lock().await,
+            Some(RecoveryTransition::Host { .. })
+        );
+        let primary = owner_token.is_some()
+            && self.app.config().identifier == "com.limusic.plus"
+            && !recovery_room;
+        let inner = self.inner.lock().await;
+        let room_code = inner.room_code.clone().ok_or("Join a room first")?;
+        let username = inner
+            .users
+            .iter()
+            .find(|u| Some(&u.user_id) == inner.my_id.as_ref())
+            .map(|u| u.username.clone())
+            .ok_or("Room identity unavailable")?;
+        // Pin the actual relay, including today's built-in default. A future default-server
+        // change must never send this reservation or its owner credential to another relay.
+        let server_url = if inner.server_url.is_empty() {
+            DEFAULT_SERVER.to_string()
+        } else {
+            inner.server_url.clone()
+        };
+        let record = SavedRoom {
+            recovery_room,
+            last_used_ms: now_ms(),
+            name: String::new(),
+            favorite: false,
+            host_name: inner
+                .users
+                .iter()
+                .find(|u| u.is_host)
+                .map(|u| u.username.clone())
+                .unwrap_or_else(|| server_url.clone()),
+            local_relay_port: inner.hosted_relay_port.filter(|_| inner.role == Role::Host),
+            server_url,
+            room_code,
+            username,
+            owner_token,
+        };
+        let mut saved = self.saved.lock().await;
+        let mut next = saved.clone();
+        upsert_saved_room(&mut next, record.clone());
+        if primary && peer::is_peer(&record.server_url) {
+            // Persist ownership before updating the removable shortcut list.
+            own_room(&self.db, &next, &record.server_url)?;
+        }
+        self.db.set_setting_checked(
+            "lt_saved_rooms",
+            &serde_json::to_string(&next).map_err(|e| e.to_string())?,
+        )?;
+        *saved = next;
+        Ok(())
+    }
+
+    pub async fn save_room(&self) -> Result<(), String> {
+        if self.saved_load_error.is_some() {
+            return Err("Saved room data could not be read; repair it before saving.".into());
+        }
+        let inner = self.inner.lock().await;
+        if inner.role == Role::None || !inner.status_connected {
+            return Err("Connect to a room before saving.".into());
+        }
+        if !inner.saved_room {
+            if inner.role == Role::Host && inner.supports_saved_rooms {
+                drop(inner);
+                self.send(ClientMessage::SaveRoom).await;
+                return Ok(());
+            }
+            return Err("This session needs an updated relay with saved rooms enabled.".into());
+        }
+        let token = inner.unsaved_owner_token.clone();
+        drop(inner);
+        self.remember_room(token).await?;
+        self.emit_notice("Host saved on this device.").await;
+        self.emit_state().await;
+        Ok(())
+    }
+
+    pub async fn forget_room(&self, server: String, code: String) -> Result<(), String> {
+        if self.saved_load_error.is_some() {
+            return Err("Saved room data could not be read; repair it before saving.".into());
+        }
+        let mut saved = self.saved.lock().await;
+        if saved.iter().any(|r| {
+            r.server_url == server && r.room_code == code && r.owner_token.is_some()
+        }) {
+            return Err("Your own rooms are permanent and cannot be forgotten.".into());
+        }
+        let next: Vec<_> = saved
+            .iter()
+            .filter(|r| r.server_url != server || r.room_code != code)
+            .cloned()
+            .collect();
+        self.db.set_setting_checked(
+            "lt_saved_rooms",
+            &serde_json::to_string(&next).map_err(|e| e.to_string())?,
+        )?;
+        *saved = next;
+        drop(saved);
+        self.emit_state().await;
+        Ok(())
+    }
+
+    /// Inspect only saved friend rooms, without joining or starting a local relay.
+    pub async fn check_saved_room(&self, server: String, code: String) -> &'static str {
+        if !self
+            .saved
+            .lock()
+            .await
+            .iter()
+            .any(|r| r.server_url == server && r.room_code == code && r.owner_token.is_none())
+        {
+            return "unknown";
+        }
+        let result = tokio::time::timeout(Duration::from_secs(8), async {
+            let mut socket = self.connect_room(canonical_server(&server)).await?;
+            probe_room(&mut socket, &code).await
+        })
+        .await;
+        match result {
+            Ok(Ok(true)) => "open",
+            Ok(Ok(false)) => "closed",
+            _ => "unknown",
+        }
+    }
+
+    async fn record_recent_use(&self) {
+        let inner = self.inner.lock().await;
+        let Some(code) = inner.room_code.as_ref() else { return };
+        let mut saved = self.saved.lock().await;
+        let mut next = saved.clone();
+        let Some(record) = next
+            .iter_mut()
+            .find(|r| r.room_code == *code && r.server_url == canonical_server(&inner.server_url))
+        else {
+            return;
+        };
+        record.last_used_ms = now_ms();
+        drop(inner);
+        if let Ok(json) = serde_json::to_string(&next) {
+            if self.db.set_setting_checked("lt_saved_rooms", &json).is_ok() {
+                *saved = next;
+            }
+        }
+    }
+
+    pub async fn update_saved_room(
+        &self,
+        server: String,
+        code: String,
+        name: Option<String>,
+        favorite: Option<bool>,
+    ) -> Result<(), String> {
+        if self.saved_load_error.is_some() {
+            return Err("Saved rooms could not be read; existing data was kept.".into());
+        }
+        let mut saved = self.saved.lock().await;
+        let mut next = saved.clone();
+        let room = next
+            .iter_mut()
+            .find(|r| r.server_url == server && r.room_code == code)
+            .ok_or("Saved room not found")?;
+        if let Some(name) = name {
+            let name = name.trim();
+            if name.chars().count() > 80 || name.chars().any(char::is_control) {
+                return Err("Choose a room name of at most 80 characters.".into());
+            }
+            room.name = name.to_string();
+        }
+        if let Some(favorite) = favorite {
+            room.favorite = favorite;
+        }
+        self.db.set_setting_checked(
+            "lt_saved_rooms",
+            &serde_json::to_string(&next).map_err(|e| e.to_string())?,
+        )?;
+        *saved = next;
+        drop(saved);
+        self.emit_state().await;
+        Ok(())
+    }
+
+    fn guest_join(&self, server: &str, room_code: String, username: String) -> ClientMessage {
+        match guest_pass(&self.db, server, &room_code) {
+            Some(guest_token) => ClientMessage::JoinSavedRoom { room_code, username, guest_token },
+            None => ClientMessage::JoinRoom { room_code, username },
+        }
+    }
+
+    pub async fn open_saved(self: &Arc<Self>, server: String, code: String) -> Result<(), String> {
+        let _action = self.hosting_action.try_lock().map_err(|_| "A room is already opening.")?;
+        let inner = self.inner.lock().await;
+        if inner.role != Role::None || inner.requesting {
+            return Err("Leave the current room first.".into());
+        }
+        drop(inner);
+        let record = self
+            .saved
+            .lock()
+            .await
+            .iter()
+            .find(|r| r.server_url == server && r.room_code == code)
+            .cloned()
+            .ok_or("Saved room not found")?;
+        let relay_port = if peer::is_peer(&record.server_url) {
+            if record.owner_token.is_some() {
+                if !self.peer.owns(&record.server_url)? {
+                    return Err("This hosting identity belongs to another installation. Join it as a guest instead.".into());
+                }
+                Some(self.start_peer_host().await?.1)
+            } else {
+                None
+            }
+        } else {
+            let port = record.relay_to_start();
+            if let Some(port) = port {
+                self.ensure_local_relay(port).await?;
+            }
+            port
+        };
+        self.set_server_url(record.server_url.clone()).await;
+        let message = match record.owner_token {
+            Some(owner_token) => ClientMessage::OpenSavedRoom {
+                room_code: record.room_code,
+                owner_token,
+                username: record.username,
+            },
+            None => self.guest_join(&record.server_url, record.room_code, record.username),
+        };
+        self.start(message, relay_port).await;
+        Ok(())
+    }
 
     pub async fn set_server_url(&self, url: String) {
         self.inner.lock().await.server_url = url;
@@ -227,12 +695,77 @@ impl LtSession {
         }
     }
 
-    pub async fn create_room(self: &Arc<Self>, username: String) {
-        self.start(ClientMessage::CreateRoom { username }).await;
+    async fn ensure_local_relay(&self, port: u16) -> Result<(), String> {
+        let relay = self.local_relay.clone();
+        tokio::task::spawn_blocking(move || relay.ensure_running(port))
+            .await
+            .map_err(|e| e.to_string())?
+    }
+
+    pub fn stop_local_relay(&self) {
+        self.local_relay.stop();
+    }
+
+    async fn start_peer_host(&self) -> Result<(String, u16), String> {
+        let relay = self.local_relay.clone();
+        let port = tokio::task::spawn_blocking(move || relay.ensure_any_port())
+            .await
+            .map_err(|e| e.to_string())??;
+        match self.peer.host(port).await {
+            Ok(address) => Ok((address, port)),
+            Err(error) => {
+                self.local_relay.stop();
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn create_room(
+        self: &Arc<Self>,
+        username: String,
+        run_local_relay: bool,
+    ) -> Result<(), String> {
+        let _action = self.hosting_action.try_lock().map_err(|_| "A room is already opening.")?;
+        if self.app.config().identifier == "com.limusic.plus" {
+            if self.saved_load_error.is_some() {
+                return Err("Saved rooms could not be read. Restore your app data before hosting.".into());
+            }
+            if self.in_room().await || self.inner.lock().await.requesting {
+                return Err("Leave the current room first.".into());
+            }
+            let (address, port) = self.start_peer_host().await?;
+            let existing = own_room(&self.db, self.saved.lock().await.as_slice(), &address)?;
+            if let Some(record) = existing {
+                self.set_server_url(address).await;
+                self.start(
+                    ClientMessage::OpenSavedRoom {
+                        room_code: record.room_code,
+                        owner_token: record.owner_token.unwrap(),
+                        username,
+                    },
+                    Some(port),
+                )
+                .await;
+            } else {
+                self.set_server_url(address).await;
+                self.start(ClientMessage::CreateRoom { username }, Some(port)).await;
+            }
+            return Ok(());
+        }
+        let port = if run_local_relay {
+            let port = local_relay::hosting_port(&self.inner.lock().await.server_url);
+            self.ensure_local_relay(port).await?;
+            Some(port)
+        } else {
+            None
+        };
+        self.start(ClientMessage::CreateRoom { username }, port).await;
+        Ok(())
     }
 
     pub async fn join_room(self: &Arc<Self>, code: String, username: String) {
-        self.start(ClientMessage::JoinRoom { room_code: code, username }).await;
+        let server = self.inner.lock().await.server_url.clone();
+        self.start(self.guest_join(&server, code.trim().to_uppercase(), username), None).await;
     }
 
     pub async fn approve_join(&self, user_id: String) {
@@ -285,9 +818,18 @@ impl LtSession {
 
     /// Leave the room and tear down the connection.
     pub async fn leave(&self) {
-        self.send(ClientMessage::LeaveRoom).await;
-        self.gen.fetch_add(1, Ordering::SeqCst); // cancel the connection loop
-        self.inner.lock().await.reset_room();
+        {
+            let mut inner = self.inner.lock().await;
+            if let Some(outbound) = &inner.outbound {
+                let _ = outbound.send(ClientMessage::LeaveRoom);
+            }
+            // Invalidate recovery before resetting the UI so a tick from the old room
+            // cannot reopen its dialog while the app is processing a window close.
+            self.gen.fetch_add(1, Ordering::SeqCst);
+            self.recovery_context.lock().await.take();
+            inner.reset_room();
+        }
+        self.clear_recovery().await;
         let _ = self.sync_tx.send(SyncCommand::Release);
         self.emit_state().await;
     }
@@ -295,17 +837,29 @@ impl LtSession {
     /// A snapshot of the client-side LT state for the UI.
     pub async fn snapshot(&self) -> serde_json::Value {
         let inner = self.inner.lock().await;
-        Self::snapshot_of(&inner)
+        let mut snapshot = Self::snapshot_of(&inner);
+        snapshot["savedRooms"] =
+            serde_json::Value::Array(self.saved.lock().await.iter().map(SavedRoom::view).collect());
+        snapshot["savedRoomsError"] = self.saved_load_error.is_some().into();
+        snapshot["localRelayAvailable"] = self.local_relay.available().into();
+        snapshot["localRelayRunning"] = self.local_relay.running().into();
+        snapshot["peerHosting"] = (self.app.config().identifier == "com.limusic.plus").into();
+        snapshot
     }
 
     // --- connection loop --------------------------------------------------------------------
 
-    async fn start(self: &Arc<Self>, initial: ClientMessage) {
+    async fn start(self: &Arc<Self>, initial: ClientMessage, hosted_relay_port: Option<u16>) {
+        let recovering = self.recovery_transition.lock().await.is_some();
+        if !recovering {
+            self.clear_recovery().await;
+        }
         // Cancel any existing connection, reset, then spawn a fresh loop.
         self.gen.fetch_add(1, Ordering::SeqCst);
         {
             let mut inner = self.inner.lock().await;
             inner.reset_room();
+            inner.hosted_relay_port = hosted_relay_port;
             inner.connecting = true;
             inner.requesting = true; // waiting for the room to materialize
         }
@@ -315,6 +869,17 @@ impl LtSession {
         tokio::spawn(async move {
             me.run(gen, initial).await;
         });
+    }
+
+    async fn connect_room(&self, url: &str) -> Result<peer::Socket, String> {
+        if peer::is_peer(url) {
+            self.peer.connect(url).await
+        } else {
+            connect_ws(url)
+                .await
+                .map(|socket| Box::new(socket) as peer::Socket)
+                .map_err(|e| e.to_string())
+        }
     }
 
     async fn run(self: Arc<Self>, gen: u64, initial: ClientMessage) {
@@ -335,7 +900,7 @@ impl LtSession {
             }
             self.emit_state().await;
 
-            match connect_ws(&url).await {
+            match self.connect_room(&url).await {
                 Ok(ws) => {
                     // A connect that outlived its cancellation must not touch shared state:
                     // `leave()` and a second Host/Join click bump `gen`, but neither can interrupt
@@ -451,7 +1016,7 @@ impl LtSession {
                 return;
             };
             attempt += 1;
-            if attempt > 15 {
+            if attempt > 15 && self.recovery_context.lock().await.is_none() {
                 self.close_locally("Lost connection to the room.").await;
                 return;
             }
@@ -460,6 +1025,7 @@ impl LtSession {
                 inner.status_connected = false;
                 inner.connecting = true;
             }
+            self.refresh_bot_room().await;
             self.emit_state().await;
             next_msg = ClientMessage::Reconnect { session_token: t };
             tokio::time::sleep(backoff_delay(attempt)).await;
@@ -467,12 +1033,32 @@ impl LtSession {
     }
 
     /// Handle one server message. Returns `true` if the connection should close (fatal).
-    async fn handle(&self, mut sm: ServerMessage) -> bool {
+    async fn handle(self: &Arc<Self>, mut sm: ServerMessage) -> bool {
         sanitize(&mut sm);
         match sm {
+            ServerMessage::RecoveryPeers { epoch, peers } => {
+                self.update_recovery_peers(epoch, peers).await;
+            }
+            ServerMessage::RecoveryReady { room_code } => {
+                self.publish_recovery(room_code).await;
+            }
+            ServerMessage::RoomAvailability { .. } => return false,
+            ServerMessage::RoomSaved { room_code, owner_token } => {
+                if self.inner.lock().await.room_code.as_ref() == Some(&room_code) {
+                    self.inner.lock().await.unsaved_owner_token = Some(owner_token.clone());
+                    if let Err(e) = self.remember_room(Some(owner_token)).await {
+                        self.emit_notice(&format!("Could not save room on this device: {e}")).await;
+                    } else {
+                        self.emit_notice("Room saved on this device.").await;
+                    }
+                }
+            }
             ServerMessage::Pong => return false,
 
             ServerMessage::RoomCreated { room_code: _, user_id, session_token, state } => {
+                let reserve = self.app.config().identifier == "com.limusic.plus"
+                    && state.supports_saved_rooms
+                    && !state.saved;
                 {
                     let mut inner = self.inner.lock().await;
                     inner.role = Role::Host;
@@ -482,7 +1068,18 @@ impl LtSession {
                     inner.absorb(&state);
                 }
                 // Seed the room with whatever we're currently playing.
-                let _ = self.sync_tx.send(SyncCommand::HostSeed);
+                let recovering = self.recovery_seed().await;
+                if recovering.is_none() {
+                    let _ = self.sync_tx.send(SyncCommand::HostSeed);
+                }
+                if reserve {
+                    self.send(ClientMessage::SaveRoom).await;
+                }
+                if let Some((state, guest_tokens)) = recovering {
+                    self.send(ClientMessage::SeedRecovery { state, guest_tokens }).await;
+                }
+                self.register_recovery(state.supports_recovery).await;
+                self.record_recent_use().await;
             }
 
             ServerMessage::JoinRequest { user_id, username } => {
@@ -499,16 +1096,37 @@ impl LtSession {
                 }
             }
 
-            ServerMessage::JoinApproved { user_id, session_token, state } => {
+            ServerMessage::JoinApproved { user_id, session_token, guest_token, state } => {
+                let supports_recovery = state.supports_recovery;
+                if let Some(token) = guest_token {
+                    let server = self.inner.lock().await.server_url.clone();
+                    if let Err(error) =
+                        remember_guest_pass(&self.db, &server, &state.room_code, token)
+                    {
+                        self.emit_notice(&format!(
+                            "Joined, but could not remember approval: {error}"
+                        ))
+                        .await;
+                    }
+                }
                 {
                     let mut inner = self.inner.lock().await;
-                    inner.role = Role::Guest;
+                    inner.role = if state.host_id == user_id { Role::Host } else { Role::Guest };
                     inner.requesting = false;
                     inner.my_id = Some(user_id);
                     inner.session_token = Some(session_token);
                     inner.absorb(&state);
                 }
                 let _ = self.sync_tx.send(SyncCommand::ApplyState(state));
+                let recovered = self.recovery_transition.lock().await.take().is_some();
+                self.inner.lock().await.recovery_busy = false;
+                if recovered {
+                    if let Err(error) = self.remember_room(None).await {
+                        self.emit_notice(&format!("Joined the replacement room, but could not save its shortcut: {error}")).await;
+                    }
+                }
+                self.register_recovery(supports_recovery).await;
+                self.record_recent_use().await;
             }
 
             ServerMessage::JoinRejected { reason } => {
@@ -518,6 +1136,7 @@ impl LtSession {
             }
 
             ServerMessage::Reconnected { user_id, is_host, state } => {
+                let supports_recovery = state.supports_recovery;
                 {
                     let mut inner = self.inner.lock().await;
                     inner.role = if is_host { Role::Host } else { Role::Guest };
@@ -528,6 +1147,8 @@ impl LtSession {
                 if !is_host {
                     let _ = self.sync_tx.send(SyncCommand::ApplyState(state));
                 }
+                self.record_recent_use().await;
+                self.register_recovery(supports_recovery).await;
             }
 
             ServerMessage::UserJoined { user } => {
@@ -543,18 +1164,24 @@ impl LtSession {
                 // Also covers a joiner who vanished while still pending: without this the host's
                 // request list keeps a row that approving can never clear.
                 inner.pending_joins.retain(|(id, _)| id != &user_id);
+                drop(inner);
+                self.refresh_bot_room().await;
             }
             ServerMessage::UserDisconnected { user_id } => {
                 let mut inner = self.inner.lock().await;
                 if let Some(u) = inner.users.iter_mut().find(|u| u.user_id == user_id) {
                     u.is_connected = false;
                 }
+                drop(inner);
+                self.refresh_bot_room().await;
             }
             ServerMessage::UserReconnected { user_id } => {
                 let mut inner = self.inner.lock().await;
                 if let Some(u) = inner.users.iter_mut().find(|u| u.user_id == user_id) {
                     u.is_connected = true;
                 }
+                drop(inner);
+                self.refresh_bot_room().await;
             }
 
             ServerMessage::HostChanged { host_id } => {
@@ -573,6 +1200,7 @@ impl LtSession {
                     }
                     became
                 };
+                self.refresh_bot_room().await;
                 if became_host {
                     // We now control playback locally — stop applying remote sync.
                     let _ = self.sync_tx.send(SyncCommand::Release);
@@ -630,6 +1258,21 @@ impl LtSession {
                 // close instead of leaving the UI spinning on "waiting for the host". Once in a
                 // room, only a dead session is fatal (`not_host` etc. are just refusals).
                 let in_room = self.inner.lock().await.role != Role::None;
+                if code == "session_expired" && self.recovery_context.lock().await.is_some() {
+                    self.gen.fetch_add(1, Ordering::SeqCst);
+                    let mut inner = self.inner.lock().await;
+                    inner.status_connected = false;
+                    inner.connecting = false;
+                    inner.outbound = None;
+                    drop(inner);
+                    self.emit_state().await;
+                    return true;
+                }
+                if code == "recovery_failed" {
+                    self.send(ClientMessage::LeaveRoom).await;
+                    self.close_locally("").await;
+                    return true;
+                }
                 if !in_room || code == "session_expired" {
                     self.close_locally("").await;
                     return true;
@@ -684,7 +1327,11 @@ impl LtSession {
             self.emit_notice(notice).await;
         }
         self.gen.fetch_add(1, Ordering::SeqCst);
+        if !self.restore_recovery_context().await {
+            self.clear_recovery().await;
+        }
         self.inner.lock().await.reset_room();
+        self.inner.lock().await.recovery_busy = false;
         let _ = self.sync_tx.send(SyncCommand::Release);
         self.emit_state().await;
     }
@@ -698,10 +1345,14 @@ impl LtSession {
             Role::Guest => "guest",
         };
         serde_json::json!({
+            "recoveryDisconnected": inner.recovery_disconnected,
+            "recoveryInviter": inner.recovery_inviter,
+            "recoveryBusy": inner.recovery_busy,
             "status": inner.status().as_str(),
             "role": role,
             "requesting": inner.requesting,
             "roomCode": inner.room_code,
+            "savedRoom": inner.saved_room,
             "myId": inner.my_id,
             "serverUrl": inner.server_url,
             // Sent so the settings panel can show what "the default" actually is once the user
@@ -719,7 +1370,7 @@ impl LtSession {
     }
 
     async fn emit_state(&self) {
-        let snap = { Self::snapshot_of(&*self.inner.lock().await) };
+        let snap = self.snapshot().await;
         let _ = self.app.emit("lt-state", snap);
     }
 
@@ -749,6 +1400,8 @@ fn keep_shareable(p: &mut Playback) {
 /// wildcard arm: a new message that carries tracks has to be decided on here.
 fn sanitize(sm: &mut ServerMessage) {
     match sm {
+        ServerMessage::RecoveryPeers { .. } | ServerMessage::RecoveryReady { .. } => {},
+        ServerMessage::RoomAvailability { .. } => {}
         ServerMessage::RoomCreated { state, .. }
         | ServerMessage::JoinApproved { state, .. }
         | ServerMessage::Reconnected { state, .. }
@@ -758,6 +1411,7 @@ fn sanitize(sm: &mut ServerMessage) {
         }
         ServerMessage::SyncPlayback(p) => keep_shareable(p),
         ServerMessage::SuggestionReceived { .. }
+        | ServerMessage::RoomSaved { .. }
         | ServerMessage::Pong
         | ServerMessage::JoinRequest { .. }
         | ServerMessage::JoinRejected { .. }
@@ -830,6 +1484,181 @@ async fn connect_first(addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn own_room_stays_pinned_across_restart_shortcut_changes_and_recovery() {
+        let path = std::env::temp_dir().join(format!("limusic-own-{}.sqlite", rand::random::<u64>()));
+        let original: SavedRoom = serde_json::from_str(r#"{"server_url":"limusic-peer://me","room_code":"ORIGINAL","username":"owner","owner_token":"private"}"#).unwrap();
+        let recovery = SavedRoom {
+            recovery_room: true,
+            room_code: "RECOVERY".into(),
+            ..original.clone()
+        };
+        {
+            let db = crate::db::Db::open(&path).unwrap();
+            assert!(own_room(&db, &[recovery.clone()], &original.server_url).unwrap().is_none());
+            let rooms = vec![recovery.clone(), original.clone()];
+            let pinned = own_room(&db, &rooms, &original.server_url).unwrap().unwrap();
+            assert_eq!(pinned.room_code, "ORIGINAL");
+            let mut rooms = vec![recovery.clone()];
+            upsert_saved_room(&mut rooms, SavedRoom { recovery_room: false, ..recovery.clone() });
+            assert!(rooms[0].recovery_room, "saving again must preserve recovery provenance");
+        }
+        {
+            let db = crate::db::Db::open(&path).unwrap();
+            let pinned = own_room(&db, &[recovery], &original.server_url).unwrap().unwrap();
+            assert_eq!(pinned.room_code, "ORIGINAL");
+            assert_eq!(pinned.owner_token, original.owner_token);
+            assert!(own_room(&db, &[], "limusic-peer://someone-else").is_err());
+            db.set_setting_checked("lt_own_room", "broken").unwrap();
+            assert!(own_room(&db, &[original.clone()], &original.server_url).is_err());
+            assert_eq!(db.get_setting("lt_own_room").as_deref(), Some("broken"));
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn guest_permission_is_private_scoped_and_survives_app_restart() {
+        let path =
+            std::env::temp_dir().join(format!("limusic-guest-{}.sqlite", rand::random::<u64>()));
+        {
+            let db = crate::db::Db::open(&path).unwrap();
+            remember_guest_pass(&db, "", "ROOM", "secret".into()).unwrap();
+        }
+        {
+            let db = crate::db::Db::open(&path).unwrap();
+            assert_eq!(guest_pass(&db, DEFAULT_SERVER, "ROOM").as_deref(), Some("secret"));
+            assert!(guest_pass(&db, "wss://another-relay/ws", "ROOM").is_none());
+            assert!(guest_pass(&db, DEFAULT_SERVER, "OTHER").is_none());
+            remember_guest_pass(&db, "", "ROOM", "replacement".into()).unwrap();
+            assert_eq!(guest_pass(&db, "", "ROOM").as_deref(), Some("replacement"));
+            assert!(
+                load_saved_rooms(&db).unwrap().is_empty(),
+                "approval does not force a saved shortcut"
+            );
+            db.set_setting_checked("lt_guest_passes", "broken").unwrap();
+            assert!(remember_guest_pass(&db, "", "ROOM", "lost".into()).is_err());
+            assert_eq!(db.get_setting("lt_guest_passes").as_deref(), Some("broken"));
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn guests_never_start_a_relay_and_saved_hosts_keep_their_local_choice() {
+        let old_json = r#"{"server_url":"ws://127.0.0.1:8080/ws","room_code":"ABCDEFGH","username":"owner","owner_token":"secret"}"#;
+        let old: SavedRoom = serde_json::from_str(old_json).unwrap();
+        assert_eq!(old.relay_to_start(), Some(8080), "old locally-owned rooms still reconnect");
+        let guest = SavedRoom { owner_token: None, ..old.clone() };
+        assert_eq!(
+            guest.relay_to_start(),
+            None,
+            "a guest's localhost bookmark must not start a relay"
+        );
+        let public = SavedRoom {
+            server_url: "wss://my-tunnel.example/ws".into(),
+            local_relay_port: Some(8080),
+            ..old.clone()
+        };
+        assert_eq!(
+            public.relay_to_start(),
+            Some(8080),
+            "a public tunnel still needs its owner's local relay"
+        );
+        let remote = SavedRoom { local_relay_port: None, ..public.clone() };
+        assert_eq!(
+            remote.relay_to_start(),
+            None,
+            "rooms on someone else's server need no local relay"
+        );
+        let mut saved = vec![public];
+        upsert_saved_room(
+            &mut saved,
+            SavedRoom { owner_token: None, local_relay_port: None, ..remote },
+        );
+        assert_eq!(
+            saved[0].relay_to_start(),
+            Some(8080),
+            "saving a guest view preserves existing owner metadata"
+        );
+    }
+
+    #[test]
+    fn saved_rooms_preserve_credentials_and_relay_identity_across_app_storage() {
+        let path =
+            std::env::temp_dir().join(format!("limusic-saved-{}.sqlite", rand::random::<u64>()));
+        {
+            let db = crate::db::Db::open(&path).unwrap();
+            let mut rooms = Vec::new();
+            let record = SavedRoom {
+                recovery_room: false,
+                last_used_ms: 123,
+                name: "Friday music".into(),
+                favorite: true,
+                host_name: "Friend".into(),
+                local_relay_port: Some(8080),
+                server_url: "wss://relay-a/ws".into(),
+                room_code: "ABCDEFGH".into(),
+                username: "owner".into(),
+                owner_token: Some("private-owner-token".into()),
+            };
+            upsert_saved_room(&mut rooms, record.clone());
+            upsert_saved_room(
+                &mut rooms,
+                SavedRoom {
+                    last_used_ms: 0,
+                    username: "new name".into(),
+                    owner_token: None,
+                    ..record.clone()
+                },
+            );
+            upsert_saved_room(
+                &mut rooms,
+                SavedRoom { server_url: "wss://relay-b/ws".into(), owner_token: None, ..record },
+            );
+            upsert_saved_room(
+                &mut rooms,
+                SavedRoom {
+                    recovery_room: false,
+                    last_used_ms: 0,
+                    name: String::new(),
+                    favorite: false,
+                    server_url: "wss://relay-a/ws".into(),
+                    room_code: "ZZZZZZZZ".into(),
+                    username: "guest".into(),
+                    host_name: "Another friend".into(),
+                    owner_token: None,
+                    local_relay_port: None,
+                },
+            );
+            db.set_setting_checked("lt_saved_rooms", &serde_json::to_string(&rooms).unwrap())
+                .unwrap();
+        }
+        {
+            let db = crate::db::Db::open(&path).unwrap();
+            let rooms = load_saved_rooms(&db).unwrap();
+            assert_eq!(
+                rooms.len(),
+                3,
+                "friends on the same relay and the same code on another relay stay separate"
+            );
+            assert_eq!(rooms[0].username, "new name");
+            assert_eq!(rooms[0].last_used_ms, 123);
+            assert_eq!(rooms[0].name, "Friday music");
+            assert!(rooms[0].favorite);
+            assert_eq!(rooms[0].owner_token.as_deref(), Some("private-owner-token"));
+            assert!(rooms[1].owner_token.is_none());
+            let view = rooms[0].view();
+            assert_eq!(view["owner"], true);
+            assert!(!view.to_string().contains("private-owner-token"));
+            assert!(view.get("owner_token").is_none());
+            db.set_setting_checked("lt_saved_rooms", "broken JSON").unwrap();
+            assert!(
+                load_saved_rooms(&db).is_err(),
+                "unreadable credentials must not be treated as an empty list"
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 
     fn track(id: &str) -> Track {
         Track {

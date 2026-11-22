@@ -7,6 +7,7 @@
 	// close — per the design, the scrobbler lives with the window controls but visually apart.
 	// Account (sign in/out) sits first in that cluster, in its own component.
 	import { onMount } from 'svelte';
+	import { appBrand } from '$lib/branding.svelte';
 	import { afterNavigate } from '$app/navigation';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import { HugeiconsIcon } from '@hugeicons/svelte';
@@ -28,11 +29,11 @@
 		Settings02Icon
 	} from '@hugeicons/core-free-icons';
 	import LastFmIcon from './LastFmIcon.svelte';
-	import DiscordIcon from './DiscordIcon.svelte';
+	import DiscordQuickJoin from './DiscordQuickJoin.svelte';
 	import AccountMenu from './AccountMenu.svelte';
 	import { appIcon } from '$lib/appicon.svelte';
 	import * as api from '$lib/api';
-	import { openMiniPlayer, playback, prefs, refreshView, toast, ui } from '$lib/player.svelte';
+	import { openMiniPlayer, playback, refreshView, toast, ui } from '$lib/player.svelte';
 	import { win } from '$lib/win.svelte';
 	import { lt } from '$lib/lt.svelte';
 	import { anchorMenu, fitMenu, NO_ANCHOR } from '$lib/menu';
@@ -62,24 +63,6 @@
 	const connecting = $derived(lastfm.connecting);
 	let menuOpen = $state(false);
 	let anchor = $state(NO_ANCHOR);
-
-	// Discord Rich Presence — a plain on/off toggle of the `discord_rpc` setting (the backend
-	// connects/clears the presence the moment it flips). Optimistic; reverted on failure. The flag
-	// lives in `prefs` because the Discord settings tab toggles the same thing: a local copy here
-	// went stale the moment the other one was used.
-	const discordOn = $derived(prefs.discordRpc);
-
-	async function toggleDiscord() {
-		const next = !discordOn;
-		prefs.discordRpc = next;
-		try {
-			await api.setSetting('discord_rpc', next ? 'true' : 'false');
-			toast.success(next ? t('integrations.discord_on') : t('integrations.discord_off'));
-		} catch (e) {
-			prefs.discordRpc = !next;
-			toast.error(String(e));
-		}
-	}
 
 	onMount(watchLastfm);
 	onMount(watchListenBrainz);
@@ -138,7 +121,7 @@
 	<span
 		class="pointer-events-none absolute inset-x-0 text-center text-xs font-medium tracking-wide text-muted-foreground"
 	>
-		Limusic
+		{appBrand.name}
 	</span>
 
 	<!-- macOS overlay style floats the traffic lights over the top-left of the webview, so the row
@@ -226,25 +209,7 @@
 			</span>
 		</button>
 
-		<button
-			class="flex h-full w-8 items-center justify-center text-muted-foreground transition-colors hover:bg-accent/10 hover:text-foreground {discordOn
-				? 'text-foreground'
-				: ''}"
-			onclick={toggleDiscord}
-			title={discordOn ? t('integrations.discord_tooltip_on') : t('integrations.discord_tooltip_off')}
-			aria-label={t('settings.general.discord_rpc')}
-		>
-			<span class="relative">
-				<DiscordIcon class="h-4 w-4" />
-				<!-- Presence status dot, Discord-style: green = live, red = off. -->
-				<span
-					class="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full ring-[1.5px] ring-background {discordOn
-						? 'bg-emerald-500'
-						: 'bg-red-500'}"
-				></span>
-			</span>
-		</button>
-
+		<DiscordQuickJoin />
 		<button
 			class="flex h-full w-8 items-center justify-center text-muted-foreground transition-colors hover:bg-accent/10 hover:text-foreground {connected
 				? 'text-foreground'

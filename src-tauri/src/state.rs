@@ -3536,6 +3536,7 @@ impl AppState {
             // The host isn't playing anything yet. Whatever the guest had on would otherwise keep
             // going, with every transport control locked while they're in the room.
             let _ = self.player.pause();
+            self.lt_mirror_queue(state.queue).await;
             return;
         };
         let already_loaded = {
@@ -3722,8 +3723,8 @@ impl AppState {
             let q = self.queue.lock().await;
             let Some(cur) = q.items.get(q.current) else { return };
             let track = song_to_track(cur);
-            let queue: Vec<Track> =
-                q.items.iter().skip(q.current + 1).take(50).map(song_to_track).collect();
+            let queue: Vec<Track> = q.items.iter().skip(q.current + 1)
+                .take(listen_protocol::MAX_SHARED_QUEUE).map(song_to_track).collect();
             (track, queue)
         };
         let mut p = Playback::new(PlaybackKind::ChangeTrack);
@@ -3758,6 +3759,22 @@ impl AppState {
         // from it would tell guests to play a song the host has paused.
         let playing = self.is_playing.load(Ordering::Relaxed);
         self.lt_broadcast_current_track(position_ms, playing).await;
+    }
+
+    /// Capture the actual local playback, including the guest's mirrored upcoming playlist.
+    /// Recovery never clears or rebuilds the local queue while the server is unavailable.
+    pub async fn lt_recovery_snapshot(&self) -> listen_protocol::RoomState {
+        let q = self.queue.lock().await;
+        listen_protocol::RoomState {
+            current_track: q.items.get(q.current).map(song_to_track),
+            queue: q.items.iter().skip(q.current + 1)
+                .take(listen_protocol::MAX_SHARED_QUEUE).map(song_to_track).collect(),
+            position_ms: (self.current_position() * 1000.0) as i64,
+            is_playing: self.is_playing.load(Ordering::Relaxed),
+            last_update_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64).unwrap_or_default(),
+            ..Default::default()
+        }
     }
 
     /// Host: broadcast play/pause with the live position. Called on a pause press (the pump's
@@ -4259,7 +4276,8 @@ impl AppState {
         }
         let queue: Vec<Track> = {
             let q = self.queue.lock().await;
-            q.items.iter().skip(q.current + 1).take(50).map(song_to_track).collect()
+            q.items.iter().skip(q.current + 1)
+                .take(listen_protocol::MAX_SHARED_QUEUE).map(song_to_track).collect()
         };
         let mut p = Playback::new(PlaybackKind::SyncQueue);
         p.queue = Some(queue);

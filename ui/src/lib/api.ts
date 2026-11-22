@@ -517,6 +517,10 @@ export interface ReleaseNote {
 }
 /** Changelog for Settings > About, from the GitHub releases API (cached in Rust per run). */
 export const releaseNotes = () => invoke<ReleaseNote[]>('release_notes');
+export const checkPlusRelease = () =>
+	invoke<{ configured: boolean; release: { version: string; downloadUrl: string } | null }>(
+		'check_plus_release'
+	);
 /** False on Linux builds that aren't the AppImage (.rpm, the AUR package): they update through the
  *  package manager, so the UI offers a download link instead of an install button. */
 export const canSelfUpdate = () => invoke<boolean>('can_self_update');
@@ -1105,8 +1109,8 @@ export const onUiVisible = (cb: (v: boolean) => void): Promise<UnlistenFn> =>
 /** `limusic-app <link>` (#348): the arguments a cold launch was given, handed over once... */
 export const takeLaunchArgs = () => invoke<string[]>('take_launch_args');
 /** ...and those of a second launch while this one runs. */
-export const onOpenLink = (cb: (args: string[]) => void): Promise<UnlistenFn> =>
-	listen<string[]>('open-link', (e) => cb(e.payload));
+export const onOpenLink = (cb: () => void): Promise<UnlistenFn> =>
+	listen('open-link', () => cb());
 export const onPosition = (cb: (p: number) => void): Promise<UnlistenFn> =>
 	listen<{ position: number }>('position', (e) => cb(e.payload.position));
 export const onDuration = (cb: (d: number) => void): Promise<UnlistenFn> =>
@@ -1313,7 +1317,26 @@ export interface LtSuggestion {
 	from_username: string;
 	track: LtTrack;
 }
+export interface LtSavedRoom {
+	lastUsedMs: number;
+	serverUrl: string;
+	roomCode: string;
+	username: string;
+	owner: boolean;
+	hostName: string;
+	name: string;
+	favorite: boolean;
+}
 export interface LtState {
+    recoveryDisconnected: boolean;
+    recoveryInviter: string | null;
+    recoveryBusy: boolean;
+	localRelayAvailable: boolean;
+	localRelayRunning: boolean;
+	peerHosting: boolean;
+	savedRoom: boolean;
+	savedRoomsError: boolean;
+	savedRooms: LtSavedRoom[];
 	status: 'disconnected' | 'connecting' | 'connected';
 	role: 'none' | 'host' | 'guest';
 	/** Asked to create/join and awaiting the room (host approval) — show a waiting state. */
@@ -1332,8 +1355,16 @@ export interface LtState {
 }
 
 export const ltGetState = () => invoke<LtState>('lt_get_state');
+export const ltSaveRoom = () => invoke<void>('lt_save_room');
+export const ltOpenSaved = (server: string, code: string) => invoke<void>('lt_open_saved', { server, code });
+export const ltCheckSavedRoom = (server: string, code: string) =>
+	invoke<'open' | 'closed' | 'unknown'>('lt_check_saved_room', { server, code });
+export const ltForgetRoom = (server: string, code: string) => invoke<void>('lt_forget_room', { server, code });
+export const ltUpdateSavedRoom = (server: string, code: string, changes: { name?: string; favorite?: boolean }) =>
+	invoke<void>('lt_update_saved_room', { server, code, name: changes.name ?? null, favorite: changes.favorite ?? null });
 export const ltSetServerUrl = (url: string) => invoke<void>('lt_set_server_url', { url });
-export const ltCreateRoom = (username: string) => invoke<void>('lt_create_room', { username });
+export const ltCreateRoom = (username: string, runLocalRelay = false) =>
+	invoke<void>('lt_create_room', { username, runLocalRelay });
 export const ltJoinRoom = (code: string, username: string) =>
 	invoke<void>('lt_join_room', { code, username });
 export const ltLeave = () => invoke<void>('lt_leave');
@@ -1341,6 +1372,8 @@ export const ltApproveJoin = (userId: string) => invoke<void>('lt_approve_join',
 export const ltRejectJoin = (userId: string) => invoke<void>('lt_reject_join', { userId });
 export const ltKick = (userId: string) => invoke<void>('lt_kick', { userId });
 export const ltTransferHost = (userId: string) => invoke<void>('lt_transfer_host', { userId });
+export const ltHostRecovery = () => invoke<void>('lt_host_recovery');
+export const ltAcceptRecovery = () => invoke<void>('lt_accept_recovery');
 export const ltApproveSuggestion = (id: string) => invoke<void>('lt_approve_suggestion', { id });
 export const ltRejectSuggestion = (id: string) => invoke<void>('lt_reject_suggestion', { id });
 export const ltRequestSync = () => invoke<void>('lt_request_sync');

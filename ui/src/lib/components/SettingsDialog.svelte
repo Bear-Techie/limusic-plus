@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { tick, untrack, type Snippet } from 'svelte';
+	import { appBrand } from '$lib/branding.svelte';
 	import { save } from '@tauri-apps/plugin-dialog';
 	import { HugeiconsIcon } from '@hugeicons/svelte';
 	import {
@@ -121,8 +122,8 @@
 		untrack(() => {
 			// Opened on a section from elsewhere (the lyrics source picker): its tab, scrolled to it
 			// once the tab has rendered. The Last.fm menu and "Edit scrobble" open a whole tab.
-			if (ui.settingsFocus === 'scrobbling') {
-				tab = 'scrobbling';
+			if (ui.settingsFocus === 'scrobbling' || ui.settingsFocus === 'discord') {
+				tab = ui.settingsFocus;
 				ui.settingsFocus = null;
 				load();
 			} else if (ui.settingsFocus) {
@@ -774,7 +775,7 @@
 							class="mb-7 rounded-xl border bg-gradient-to-br from-primary/8 to-transparent px-4 py-4"
 						>
 							<div class="flex items-center gap-2">
-								<span class="font-heading text-lg font-bold">Limusic</span>
+								<span class="font-heading text-lg font-bold">{appBrand.name}</span>
 								{#if version}
 									<span
 										class="rounded-full bg-primary/12 px-2 py-0.5 text-[11px] font-semibold text-primary"
@@ -805,7 +806,7 @@
 							<div data-settings-card class={CARD}>
 								{@render row({
 									title: t('settings.about.check_updates'),
-									desc: updateState.available && !updateState.canInstall
+								desc: updateState.available && !updateState.canInstall && !updateState.available.downloadUrl
 										? `${availableMessage(updateState.available)} ${t('settings.about.update_packaged')}`
 										: updateState.available
 											? availableMessage(updateState.available)

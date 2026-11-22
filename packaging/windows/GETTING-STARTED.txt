@@ -1,0 +1,55 @@
+LIMUSIC PLUS - AUTOMATIC PER-PC HOSTING (EXPERIMENTAL)
+
+Open Limusic Plus from your desktop or Start menu. Only the app starts.
+The application executable is Limusic Plus.exe; its window, tray and About
+screen use the same name. Quit your running copy from the tray before upgrading.
+Your existing settings, saved rooms and permissions are preserved.
+No terminal commands, accounts, router setup, or port forwarding are required.
+
+Discord broadcasting is an optional installer task. Select it if you want to
+broadcast from Settings > Discord using your own Discord bot. Listeners only
+need to join the Discord voice channel. See docs/DISCORD-VOICE.md in the
+included source archive for bot setup.
+
+Host: Open Listen Together, enter your name and choose Host. Your local relay
+starts silently and the app establishes automatic encrypted connectivity.
+Your session saves automatically and reopens when you host again.
+Copy the complete invite and share it once with friends using this Plus build.
+
+Join: Paste your friend's complete invite, join, and wait for their approval.
+Choose Save session; the Saved checkmark confirms it. Next time, use Reconnect.
+Approval is remembered on your device; you can return freely while the room is
+open. A kick revokes this permission. Use stars, Rename and Forget to organize
+your saved rooms, including through Manage saved rooms while listening.
+Host shows your sessions; Join shows friends' rooms. Availability is checked
+automatically, with open rooms first and recent use next. At startup, a popup
+offers confirmed-open friends' rooms. Nothing is joined automatically; Not now
+dismisses the popup. No popup is shown when no open rooms can be confirmed.
+Your friend must be online and hosting. You can host your own session too;
+this does not move their session to your PC. Joining starts no local relay.
+
+Close the window to keep listening in the system tray. Choose Quit from the
+tray icon to exit the app and stop its relay. A hosted session depends on the
+PC that started its relay, including after transferring playback control.
+
+If that PC disconnects, updated apps can still contact the remaining members.
+Listen Together offers Keep waiting or Host and invite friends. A volunteer
+starts a replacement room; others must choose Join replacement room to move.
+Recovery keeps the current track, playback position, play/pause state and up
+to 5,000 upcoming tracks. Invited members receive remembered entrance permission
+for the replacement room, and its shortcut is saved separately. Everyone needs
+this updated Plus build. Invitations last ten minutes while the apps stay open;
+old saved room addresses continue to refer to the PC that originally hosted them.
+
+Connections use public Iroh discovery and encrypted relay fallback services.
+These have rate limits and no uptime guarantee. Test with your friends before
+relying on this experimental build. Everyone streams their own music.
+
+App data: %APPDATA%\com.limusic.plus
+Relay reservations: %LOCALAPPDATA%\LimusicRelay\saved-rooms.sqlite3
+Back up both folders together. Removing them can invalidate saved invites.
+Uninstalling preserves data. Do not share private app databases with friends.
+Update with a new Plus installer; original Limusic settings are not imported.
+
+This is an unofficial modified build of Limusic. See LICENSE, the included
+source archive, and docs/SAVED-ROOMS.md for details and original attribution.

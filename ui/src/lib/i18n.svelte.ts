@@ -6,6 +6,14 @@ import { browser } from '$app/environment';
 import { invoke } from '@tauri-apps/api/core';
 import { translations, LOCALES, type LocaleId, type Translations } from './locales';
 import { coverage, pickLocale } from './langlist';
+import { appBrand } from './branding.svelte';
+
+// These strings name the upstream project, its template, or a registered external app.
+const upstreamNameKeys = new Set<string>([
+	'settings.general.language_contribute', 'settings.themes.matugen_hint',
+	'settings.about.kofi_hint', 'settings.scrobbling.account_connecting',
+	'integrations.lastfm_approve_in_browser'
+]);
 
 export type { LocaleId };
 
@@ -82,8 +90,13 @@ export function t(key: TranslationKey, params?: Record<string, string | number>)
 	// catalog must render English, not a blank label.
 	if (typeof str !== 'string' || str === '') str = getNestedValue(translations.en, key);
 	if (typeof str !== 'string') return key;
-	if (!params) return str;
-	return str.replace(/\{(\w+)\}/g, (_, k) => (params[k] !== undefined ? String(params[k]) : `{${k}}`));
+	let text = str;
+	if (!key.startsWith('settings.discord.') && !upstreamNameKeys.has(key)) {
+		// Brand catalog text before interpolation: track titles and user names are left intact.
+		text = text.replace(/\bLimusic\b(?! Plus\b)/g, () => appBrand.name);
+	}
+	if (!params) return text;
+	return text.replace(/\{(\w+)\}/g, (_, k) => (params[k] !== undefined ? String(params[k]) : `{${k}}`));
 }
 
 /**

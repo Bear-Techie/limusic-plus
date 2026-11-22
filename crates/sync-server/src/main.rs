@@ -8,7 +8,7 @@
 //! ponytail: one global `Mutex<HashMap<room, Room>>` and unbounded per-client channels — right for
 //! a personal server (tens of users). If it ever needs to scale, shard by room / add backpressure.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -32,10 +32,8 @@ const SWEEP_EVERY: Duration = Duration::from_secs(5);
 const MAX_USERS_PER_ROOM: usize = 50;
 /// Rooms the server holds at once. The default server is public, and every room is memory.
 const MAX_ROOMS: usize = 1000;
-/// Upcoming tracks a room keeps. The client sends at most 50.
-const MAX_QUEUE: usize = 50;
-/// Largest message accepted. A full 50-track queue is ~40 KiB; tungstenite's default is 64 MiB.
-const MAX_MESSAGE: usize = 256 * 1024;
+const MAX_QUEUE: usize = listen_protocol::MAX_SHARED_QUEUE;
+const MAX_MESSAGE: usize = listen_protocol::MAX_ROOM_MESSAGE;
 /// A connection that sends nothing for this long is dropped. Clients ping every 25s.
 const IDLE_LIMIT: Duration = Duration::from_secs(90);
 /// Room code alphabet — no `I`/`O` to avoid confusion (context/19 §2.2).
@@ -44,6 +42,7 @@ const CODE_ALPHABET: &[u8] = b"1234567890QWERTYUPASDFGHJKLZXCVBNM";
 type Tx = mpsc::UnboundedSender<ServerMessage>;
 
 struct Peer {
+    guest_token: Option<String>,
     username: String,
     tx: Tx,
     connected: bool,
@@ -53,11 +52,17 @@ struct Peer {
 
 /// A joiner awaiting host approval (not yet a room member).
 struct Pending {
+    owner: bool,
     username: String,
     tx: Tx,
 }
 
 struct Room {
+    recovery_epoch: String,
+    recovery_endpoints: HashMap<String, String>,
+    approved_guests: HashSet<String>,
+    saved: bool,
+    owner_id: Option<String>,
     host_id: String,
     peers: HashMap<String, Peer>,
     pending: HashMap<String, Pending>,
@@ -71,6 +76,59 @@ struct Room {
 }
 
 impl Room {
+    fn admit(
+        &mut self,
+        code: &str,
+        user_id: String,
+        username: String,
+        tx: Tx,
+        guest_token: String,
+    ) {
+        let returning = self.peers.contains_key(&user_id);
+        let session_token = gen_token();
+        self.peers.insert(
+            user_id.clone(),
+            Peer {
+                guest_token: Some(guest_token.clone()),
+                username: username.clone(),
+                tx: tx.clone(),
+                connected: true,
+                session_token: session_token.clone(),
+                disconnected_at: None,
+            },
+        );
+        let now = now_ms();
+        let mut state = self.wire_state(code);
+        state.position_ms = state.live_position_ms(now);
+        state.last_update_ms = now;
+        let _ = tx.send(ServerMessage::JoinApproved {
+            user_id: user_id.clone(),
+            session_token,
+            guest_token: Some(guest_token),
+            state,
+        });
+        if returning {
+            self.broadcast(
+                &ServerMessage::UserReconnected { user_id: user_id.clone() },
+                Some(&user_id),
+            );
+            if self.is_host(&user_id) {
+                self.brief_host();
+            }
+            return;
+        }
+        self.broadcast(
+            &ServerMessage::UserJoined {
+                user: User {
+                    user_id: user_id.clone(),
+                    username,
+                    is_host: false,
+                    is_connected: true,
+                },
+            },
+            Some(&user_id),
+        );
+    }
     fn wire_users(&self) -> Vec<User> {
         self.peers
             .iter()
@@ -85,6 +143,9 @@ impl Room {
 
     fn wire_state(&self, code: &str) -> RoomState {
         RoomState {
+            supports_recovery: true,
+            supports_saved_rooms: true,
+            saved: self.saved,
             room_code: code.to_string(),
             host_id: self.host_id.clone(),
             users: self.wire_users(),
@@ -130,6 +191,19 @@ impl Room {
         self.host_id = id.clone();
         self.broadcast(&ServerMessage::HostChanged { host_id: id }, None);
         self.brief_host();
+        self.broadcast_recovery();
+    }
+
+    fn broadcast_recovery(&self) {
+        if self.recovery_endpoints.is_empty() { return; }
+        let peers = self.recovery_endpoints.iter().filter_map(|(id, endpoint)| {
+            let p = self.peers.get(id)?;
+            Some(listen_protocol::RecoveryPeer {
+                user_id: id.clone(), username: p.username.clone(),
+                endpoint_id: endpoint.clone(), is_host: self.host_id == *id,
+            })
+        }).collect();
+        self.broadcast(&ServerMessage::RecoveryPeers { epoch: self.recovery_epoch.clone(), peers }, None);
     }
 
     /// (Re)send the host everything only a host can act on. Join requests and guest adds are sent
@@ -170,6 +244,9 @@ impl Room {
 #[derive(Default)]
 struct Server {
     rooms: Mutex<HashMap<String, Room>>,
+    // SQLite commits the reservation before acknowledging it. Never falls back to an empty DB
+    // on an open/read error: losing reservations would allow existing codes to be reassigned.
+    saved: std::sync::Mutex<Option<rusqlite::Connection>>,
 }
 
 fn now_ms() -> i64 {
@@ -196,11 +273,59 @@ fn err(code: &str, message: &str) -> ServerMessage {
 }
 
 impl Server {
+    fn with_store(path: &std::path::Path) -> rusqlite::Result<Self> {
+        let db = rusqlite::Connection::open(path)?;
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS saved_rooms (
+            code TEXT PRIMARY KEY, token TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS approved_guests (
+             room_code TEXT NOT NULL, token TEXT NOT NULL,
+             PRIMARY KEY(room_code, token))",
+        )?;
+        Ok(Self { rooms: Mutex::new(HashMap::new()), saved: std::sync::Mutex::new(Some(db)) })
+    }
+
+    fn reservation(&self, code: &str) -> rusqlite::Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        match self.saved.lock().unwrap().as_ref() {
+            Some(db) => db
+                .query_row("SELECT token FROM saved_rooms WHERE code = ?1", [code], |r| r.get(0))
+                .optional(),
+            None => Ok(None),
+        }
+    }
+
+    fn approved_guests(&self, code: &str) -> rusqlite::Result<HashSet<String>> {
+        let store = self.saved.lock().unwrap();
+        let Some(db) = store.as_ref() else { return Ok(HashSet::new()) };
+        let mut query = db.prepare("SELECT token FROM approved_guests WHERE room_code = ?1")?;
+        let result = query.query_map([code], |r| r.get(0))?.collect();
+        result
+    }
+
+    fn persist_guest(&self, code: &str, token: &str, remove: bool) -> rusqlite::Result<()> {
+        let store = self.saved.lock().unwrap();
+        if let Some(db) = store.as_ref() {
+            if remove {
+                db.execute(
+                    "DELETE FROM approved_guests WHERE room_code = ?1 AND token = ?2",
+                    [code, token],
+                )?;
+            } else {
+                db.execute(
+                    "INSERT OR IGNORE INTO approved_guests(room_code, token) VALUES(?1, ?2)",
+                    [code, token],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Handle one decoded message. `uid`/`room_code` track this connection's identity and are
     /// updated in place as it creates/joins/reconnects.
     async fn dispatch(
         &self,
-        cm: ClientMessage,
+        mut cm: ClientMessage,
         tx: &Tx,
         uid: &mut Option<String>,
         room_code: &mut Option<String>,
@@ -213,13 +338,109 @@ impl Server {
                 cm,
                 ClientMessage::CreateRoom { .. }
                     | ClientMessage::JoinRoom { .. }
+                    | ClientMessage::JoinSavedRoom { .. }
                     | ClientMessage::Reconnect { .. }
+                    | ClientMessage::OpenSavedRoom { .. }
             )
         {
             let _ = tx.send(err("already_in_room", "Leave this room first."));
             return;
         }
+        let mut reopen_code = None;
+        let mut owner_join = false;
+        let mut returning_guest = None;
+        if let ClientMessage::JoinSavedRoom { room_code, username, guest_token } = cm {
+            returning_guest = Some(guest_token);
+            cm = ClientMessage::JoinRoom { room_code, username };
+        }
+        if let ClientMessage::OpenSavedRoom { room_code: code, owner_token, username } = cm {
+            match self.reservation(&code) {
+                Ok(Some(token)) if token == owner_token => {}
+                _ => {
+                    let _ = tx.send(err(
+                        "saved_room_unavailable",
+                        "Saved room unavailable or owner credential invalid.",
+                    ));
+                    return;
+                }
+            }
+            let rooms = self.rooms.lock().await;
+            cm = if let Some(room) = rooms.get(&code) {
+                if let Some(peer) = room.owner_id.as_ref().and_then(|id| room.peers.get(id)) {
+                    ClientMessage::Reconnect { session_token: peer.session_token.clone() }
+                } else {
+                    // Leaving or being kicked removes membership. Ownership never bypasses the
+                    // current host's approval or takes their role away.
+                    owner_join = true;
+                    ClientMessage::JoinRoom { room_code: code, username }
+                }
+            } else {
+                reopen_code = Some(code);
+                ClientMessage::CreateRoom { username }
+            };
+        }
         match cm {
+            ClientMessage::CheckRoom { room_code } => {
+                let code = room_code.trim().to_uppercase();
+                let open = self.rooms.lock().await.get(&code).is_some_and(Room::host_is_reachable);
+                let _ = tx.send(ServerMessage::RoomAvailability { room_code: code, open });
+            }
+            ClientMessage::OpenSavedRoom { .. } | ClientMessage::JoinSavedRoom { .. } => {
+                unreachable!()
+            }
+            ClientMessage::SaveRoom => {
+                let (Some(me), Some(code)) = (uid.as_ref(), room_code.as_ref()) else { return };
+                let mut rooms = self.rooms.lock().await;
+                let Some(room) = rooms.get_mut(code) else { return };
+                if !room.is_host(me) {
+                    let _ = tx.send(err("not_host", "Only the host can save this room."));
+                    return;
+                }
+                if room.saved {
+                    // Safe retry if the acknowledgement was lost. A successor host cannot obtain
+                    // the owner's credential.
+                    if room.owner_id.as_ref() == Some(me) {
+                        if let Ok(Some(token)) = self.reservation(code) {
+                            let _ = tx.send(ServerMessage::RoomSaved {
+                                room_code: code.clone(),
+                                owner_token: token,
+                            });
+                        }
+                    } else {
+                        let _ = tx.send(err("already_saved", "This room already has an owner."));
+                    }
+                    return;
+                }
+                let token = gen_token();
+                let store = self.saved.lock().unwrap();
+                let result = store.as_ref().ok_or(()).and_then(|db| {
+                    let count: i64 = db
+                        .query_row("SELECT COUNT(*) FROM saved_rooms", [], |r| r.get(0))
+                        .map_err(|_| ())?;
+                    if count >= MAX_ROOMS as i64 {
+                        return Err(());
+                    }
+                    let transaction = db.unchecked_transaction().map_err(|_| ())?;
+                    transaction.execute(
+                        "INSERT INTO saved_rooms(code, token) VALUES(?1, ?2)",
+                        [code, &token],
+                    )
+                    .map_err(|_| ())?;
+                    for guest_token in &room.approved_guests {
+                        transaction.execute("INSERT OR IGNORE INTO approved_guests(room_code, token) VALUES(?1, ?2)", [code, guest_token]).map_err(|_| ())?;
+                    }
+                    transaction.commit().map_err(|_| ())
+                });
+                if result.is_err() {
+                    let _ = tx.send(err("save_failed", "The relay could not persist this room. Update/configure the relay and try again."));
+                    return;
+                }
+                room.saved = true;
+                room.owner_id = Some(me.clone());
+                let _ = tx
+                    .send(ServerMessage::RoomSaved { room_code: code.clone(), owner_token: token });
+                room.broadcast(&ServerMessage::SyncState { state: room.wire_state(code) }, None);
+            }
             ClientMessage::Ping => {
                 let _ = tx.send(ServerMessage::Pong);
             }
@@ -230,10 +451,29 @@ impl Server {
                     let _ = tx.send(err("server_full", "The server is full, try again later."));
                     return;
                 }
-                let code = loop {
-                    let c = gen_code();
-                    if !rooms.contains_key(&c) {
-                        break c;
+                let code = if let Some(code) = reopen_code {
+                    if rooms.contains_key(&code) {
+                        let _ =
+                            tx.send(err("room_busy", "Room opened elsewhere; reconnect again."));
+                        return;
+                    }
+                    code
+                } else {
+                    loop {
+                        let c = gen_code();
+                        if !rooms.contains_key(&c) {
+                            match self.reservation(&c) {
+                                Ok(None) => break c,
+                                Ok(Some(_)) => continue,
+                                Err(_) => {
+                                    let _ = tx.send(err(
+                                        "storage_failed",
+                                        "The relay room registry is unavailable.",
+                                    ));
+                                    return;
+                                }
+                            }
+                        }
                     }
                 };
                 let user_id = gen_user_id();
@@ -242,6 +482,7 @@ impl Server {
                 peers.insert(
                     user_id.clone(),
                     Peer {
+                        guest_token: None,
                         username: sanitize(&username),
                         tx: tx.clone(),
                         connected: true,
@@ -250,6 +491,20 @@ impl Server {
                     },
                 );
                 let room = Room {
+                    recovery_epoch: gen_token(),
+                    recovery_endpoints: HashMap::new(),
+                    approved_guests: match self.approved_guests(&code) {
+                        Ok(guests) => guests,
+                        Err(_) => {
+                            let _ = tx.send(err(
+                                "storage_failed",
+                                "The relay approval registry is unavailable.",
+                            ));
+                            return;
+                        }
+                    },
+                    saved: matches!(self.reservation(&code), Ok(Some(_))),
+                    owner_id: Some(user_id.clone()),
                     host_id: user_id.clone(),
                     peers,
                     pending: HashMap::new(),
@@ -280,8 +535,28 @@ impl Server {
                     let _ = tx.send(err("room_not_found", "No room with that code."));
                     return;
                 };
-                // No reachable host means nobody can ever approve this request — say so instead of
-                // parking the joiner on "waiting for the host" forever.
+                if let Some(token) =
+                    returning_guest.filter(|token| room.approved_guests.contains(token))
+                {
+                    // Replace this guest's stale socket/slot, rather than accumulating duplicates.
+                    let previous = room
+                        .peers
+                        .iter()
+                        .find(|(_, peer)| peer.guest_token.as_ref() == Some(&token))
+                        .map(|(id, _)| id.clone());
+                    if previous.is_none()
+                        && room.peers.len() + room.pending.len() >= MAX_USERS_PER_ROOM
+                    {
+                        let _ = tx.send(err("room_full", "That room is full."));
+                        return;
+                    }
+                    let user_id = previous.unwrap_or_else(gen_user_id);
+                    room.admit(&code, user_id.clone(), sanitize(&username), tx.clone(), token);
+                    *uid = Some(user_id);
+                    *room_code = Some(code);
+                    return;
+                }
+                // Only new guests need a reachable host to answer a request.
                 if !room.host_is_reachable() {
                     let _ =
                         tx.send(err("host_unavailable", "The host isn't in that room right now."));
@@ -294,7 +569,7 @@ impl Server {
                 let user_id = gen_user_id();
                 room.pending.insert(
                     user_id.clone(),
-                    Pending { username: sanitize(&username), tx: tx.clone() },
+                    Pending { owner: owner_join, username: sanitize(&username), tx: tx.clone() },
                 );
                 let host_id = room.host_id.clone();
                 let uname = room.pending[&user_id].username.clone();
@@ -314,38 +589,30 @@ impl Server {
                     let _ = tx.send(err("not_host", "Only the host can approve joins."));
                     return;
                 }
-                let Some(p) = room.pending.remove(&joiner) else { return };
-                let token = gen_token();
-                room.peers.insert(
-                    joiner.clone(),
-                    Peer {
-                        username: p.username.clone(),
-                        tx: p.tx.clone(),
-                        connected: true,
-                        session_token: token.clone(),
-                        disconnected_at: None,
-                    },
-                );
-                // Normalize to the live position so the joiner seeks to where the host *is now*,
-                // not where the host last reported (else they'd restart mid-song). context/19 §6.2.
-                let now = now_ms();
-                let mut state = room.wire_state(&code);
-                state.position_ms = state.live_position_ms(now);
-                state.last_update_ms = now;
-                let user = User {
-                    user_id: joiner.clone(),
-                    username: p.username,
-                    is_host: false,
-                    is_connected: true,
-                };
-                // The joiner gets the full state (their client resolves current_track + seeks to the
-                // live position); everyone else just sees a new participant.
-                let _ = p.tx.send(ServerMessage::JoinApproved {
-                    user_id: joiner.clone(),
-                    session_token: token,
-                    state,
-                });
-                room.broadcast(&ServerMessage::UserJoined { user }, Some(&joiner));
+                if !room.pending.contains_key(&joiner) {
+                    return;
+                }
+                // Commit permission before acknowledging approval. Never promise durable access
+                // when the relay could not save it.
+                if room.approved_guests.len() >= 1024 {
+                    let _ =
+                        tx.send(err("approval_limit", "Too many remembered guests in this room."));
+                    return;
+                }
+                let guest_token = gen_token();
+                if room.saved && self.persist_guest(&code, &guest_token, false).is_err() {
+                    let _ = tx.send(err(
+                        "storage_failed",
+                        "Could not remember this approval. Try again.",
+                    ));
+                    return;
+                }
+                room.approved_guests.insert(guest_token.clone());
+                let p = room.pending.remove(&joiner).unwrap();
+                if p.owner {
+                    room.owner_id = Some(joiner.clone());
+                }
+                room.admit(&code, joiner, p.username, p.tx, guest_token);
             }
 
             ClientMessage::RejectJoin { user_id: joiner } => {
@@ -486,11 +753,23 @@ impl Server {
                 if !room.is_host(&me) || target == me {
                     return;
                 }
+                if let Some(token) = room.peers.get(&target).and_then(|p| p.guest_token.clone()) {
+                    if room.saved && self.persist_guest(&code, &token, true).is_err() {
+                        let _ = tx.send(err(
+                            "storage_failed",
+                            "Could not revoke this guest's access. Try again.",
+                        ));
+                        return;
+                    }
+                    room.approved_guests.remove(&token);
+                }
                 if let Some(p) = room.peers.remove(&target) {
+                    room.recovery_endpoints.remove(&target);
                     let _ = p.tx.send(ServerMessage::Kicked {
                         reason: "The host removed you from the room.".into(),
                     });
                     room.broadcast(&ServerMessage::UserLeft { user_id: target }, None);
+                    room.broadcast_recovery();
                 }
             }
 
@@ -553,6 +832,61 @@ impl Server {
                     self.remove_member(&mut rooms, &code, &me, /*graceful=*/ true);
                 }
             }
+            ClientMessage::RegisterRecovery { endpoint_id } => {
+                let endpoint_id = endpoint_id.to_ascii_lowercase();
+                let (Some(me), Some(code)) = (uid.as_ref(), room_code.as_ref()) else { return };
+                let mut rooms = self.rooms.lock().await;
+                let Some(room) = rooms.get_mut(code) else { return };
+                if !room.peers.get(me).is_some_and(|p| p.connected && p.tx.same_channel(tx)) {
+                    return; // Pending joiners cannot discover or advertise member endpoints.
+                }
+                if endpoint_id.len() != 64 || !endpoint_id.bytes().all(|b| b.is_ascii_hexdigit())
+                    || room.recovery_endpoints.iter().any(|(id, e)| id != me && e == &endpoint_id)
+                {
+                    let _ = tx.send(err("invalid_recovery_endpoint", "Invalid recovery address."));
+                    return;
+                }
+                room.recovery_endpoints.insert(me.clone(), endpoint_id);
+                room.broadcast_recovery();
+            }
+            ClientMessage::SeedRecovery { state, guest_tokens } => {
+                let (Some(me), Some(code)) = (uid.as_ref(), room_code.as_ref()) else { return };
+                let mut rooms = self.rooms.lock().await;
+                let Some(room) = rooms.get_mut(code) else { return };
+                if !room.is_host(me) || room.peers.len() != 1 {
+                    let _ = tx.send(err("recovery_failed", "Only an empty room can receive a recovered playlist."));
+                    return;
+                }
+                if guest_tokens.len() >= MAX_USERS_PER_ROOM || guest_tokens.iter().any(|t|
+                    t.len() != 64 || !t.bytes().all(|b| b.is_ascii_hexdigit())) {
+                    let _ = tx.send(err("recovery_failed", "Invalid recovery permissions."));
+                    return;
+                }
+                // Commit every new pass together before sending any invitations.
+                let result = (|| -> rusqlite::Result<()> {
+                    let store = self.saved.lock().unwrap();
+                    if let Some(db) = store.as_ref().filter(|_| room.saved) {
+                        let transaction = db.unchecked_transaction()?;
+                        for token in &guest_tokens {
+                            transaction.execute("INSERT OR IGNORE INTO approved_guests(room_code, token) VALUES(?1, ?2)", [code, token])?;
+                        }
+                        transaction.commit()?;
+                    }
+                    Ok(())
+                })();
+                if result.is_err() {
+                    let _ = tx.send(err("recovery_failed", "Could not save recovery permissions. Try again."));
+                    return;
+                }
+                room.approved_guests.extend(guest_tokens);
+                let now = now_ms();
+                room.position_ms = state.live_position_ms(now).max(0);
+                room.current_track = state.current_track;
+                room.queue = state.queue.into_iter().take(MAX_QUEUE).collect();
+                room.is_playing = state.is_playing;
+                room.last_update_ms = now;
+                let _ = tx.send(ServerMessage::RecoveryReady { room_code: code.clone() });
+            }
         }
     }
 
@@ -568,6 +902,7 @@ impl Server {
     ) {
         let Some(room) = rooms.get_mut(code) else { return };
         room.drop_pending(me);
+        room.recovery_endpoints.remove(me);
         if room.peers.remove(me).is_some() && graceful {
             room.broadcast(&ServerMessage::UserLeft { user_id: me.to_string() }, None);
         }
@@ -587,6 +922,8 @@ impl Server {
             }
             rooms.remove(code);
             tracing::info!(room = %code, "room closed (last member left)");
+        } else {
+            room.broadcast_recovery();
         }
     }
 
@@ -720,11 +1057,19 @@ async fn main() {
         .init();
 
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8080);
-    let addr = format!("0.0.0.0:{port}");
+    let bind_ip = std::env::var("BIND_ADDRESS")
+        .unwrap_or_else(|_| "0.0.0.0".into())
+        .parse::<std::net::IpAddr>()
+        .expect("valid BIND_ADDRESS");
+    let addr = std::net::SocketAddr::new(bind_ip, port);
     let listener = TcpListener::bind(&addr).await.expect("bind");
     tracing::info!(%addr, "limusic-sync listening (plain ws — front with Tailscale/Cloudflare for wss)");
 
-    let server = Arc::new(Server::default());
+    let store_path =
+        std::env::var_os("LIMUSIC_ROOMS_DB").unwrap_or_else(|| "saved-rooms.sqlite3".into());
+    let server = Arc::new(
+        Server::with_store(std::path::Path::new(&store_path)).expect("open saved room registry"),
+    );
 
     // Background cleanup sweep.
     {
@@ -752,6 +1097,515 @@ async fn main() {
 mod tests {
     use super::*;
     use listen_protocol::Playback;
+
+    #[tokio::test]
+    async fn recovery_contacts_are_members_only_and_follow_transfers_and_kicks() {
+        let server = Server::default();
+        let (mut host, mut guest, _) = room_with_guest(&server).await;
+        let code = host.code.clone().unwrap();
+        host.send(&server, ClientMessage::RegisterRecovery { endpoint_id: "a".repeat(64) }).await;
+        guest.send(&server, ClientMessage::RegisterRecovery { endpoint_id: "b".repeat(64) }).await;
+        let mut pending = Conn::new();
+        pending.send(&server, ClientMessage::JoinRoom { room_code: code.clone(), username: "Pending".into() }).await;
+        host.drain(); guest.drain();
+        pending.send(&server, ClientMessage::RegisterRecovery { endpoint_id: "c".repeat(64) }).await;
+        assert!(pending.drain().is_empty(), "pending joiners never receive recovery contacts");
+        assert_eq!(server.rooms.lock().await[&code].recovery_endpoints.len(), 2);
+        // Duplicate endpoints cannot alias an existing member.
+        guest.send(&server, ClientMessage::RegisterRecovery { endpoint_id: "A".repeat(64) }).await;
+        assert!(matches!(guest.drain().as_slice(), [ServerMessage::Error { .. }]));
+        host.send(&server, ClientMessage::TransferHost { user_id: guest.id() }).await;
+        let messages = guest.drain();
+        assert!(messages.iter().any(|m| matches!(m, ServerMessage::RecoveryPeers { peers, .. }
+            if peers.len() == 2 && peers.iter().any(|p| p.user_id == guest.id() && p.is_host))));
+        guest.send(&server, ClientMessage::KickUser { user_id: host.id() }).await;
+        assert!(guest.drain().iter().any(|m| matches!(m, ServerMessage::RecoveryPeers { peers, .. }
+            if peers.len() == 1 && peers[0].user_id == guest.id())));
+        assert!(!server.rooms.lock().await[&code].recovery_endpoints.contains_key(&host.id()));
+    }
+
+    fn recovery_playlist() -> RoomState {
+        let track = |n: usize| Track {
+            id: format!("{n:011}"), title: format!("Track {n}"), artist: "Artist".into(),
+            thumbnail: None, duration_ms: 240_000, queued_by: None,
+        };
+        RoomState {
+            current_track: Some(track(0)), queue: (1..=137).map(track).collect(),
+            position_ms: 32_100, is_playing: false, ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_preserves_long_playlist_and_fresh_permissions_survive_restart() {
+        let path = std::env::temp_dir().join(format!("limusic-recovery-{}.sqlite3", gen_token()));
+        let guest_token = "d".repeat(64);
+        let (code, owner_token);
+        {
+            let server = Server::with_store(&path).unwrap();
+            let mut host = Conn::new();
+            host.send(&server, ClientMessage::CreateRoom { username: "Successor".into() }).await;
+            code = host.code.clone().unwrap();
+            host.drain();
+            owner_token = save_host(&server, &mut host).await;
+            host.send(&server, ClientMessage::SeedRecovery { state: recovery_playlist(), guest_tokens: vec![guest_token.clone()] }).await;
+            assert!(matches!(host.drain().as_slice(), [ServerMessage::RecoveryReady { .. }]));
+            let mut guest = Conn::new();
+            guest.send(&server, ClientMessage::JoinSavedRoom {
+                room_code: code.clone(), username: "Guest".into(), guest_token: guest_token.clone(),
+            }).await;
+            let messages = guest.drain();
+            let state = messages.iter().find_map(|m| if let ServerMessage::JoinApproved { state, .. } = m { Some(state) } else { None }).unwrap();
+            assert_eq!(state.queue, recovery_playlist().queue, "more than fifty upcoming tracks survive");
+            assert_eq!(state.current_track, recovery_playlist().current_track);
+            assert_eq!(state.position_ms, 32_100);
+            assert!(!state.is_playing, "paused playback stays paused");
+            // A guest cannot overwrite playback or issue recovery permissions.
+            guest.send(&server, ClientMessage::SeedRecovery { state: RoomState::default(), guest_tokens: vec!["e".repeat(64)] }).await;
+            assert!(matches!(guest.drain().as_slice(), [ServerMessage::Error { .. }]));
+            assert_eq!(server.rooms.lock().await[&code].queue.len(), 137);
+        }
+        {
+            let server = Server::with_store(&path).unwrap();
+            let mut host = Conn::new();
+            host.send(&server, ClientMessage::OpenSavedRoom { room_code: code.clone(), owner_token, username: "Successor".into() }).await;
+            host.drain();
+            let mut guest = Conn::new();
+            guest.send(&server, ClientMessage::JoinSavedRoom { room_code: code.clone(), username: "Guest".into(), guest_token }).await;
+            assert!(matches!(guest.drain().as_slice(), [ServerMessage::JoinApproved { .. }]));
+            let mut outsider = Conn::new();
+            outsider.send(&server, ClientMessage::JoinSavedRoom { room_code: code.clone(), username: "Guest".into(), guest_token: "f".repeat(64) }).await;
+            assert!(outsider.drain().is_empty(), "names and unknown passes cannot bypass approval");
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_storage_failure_does_not_publish_invites_or_replace_state() {
+        let path = std::env::temp_dir().join(format!("limusic-recovery-failure-{}.sqlite3", gen_token()));
+        {
+            let server = Server::with_store(&path).unwrap();
+            let mut host = Conn::new();
+            host.send(&server, ClientMessage::CreateRoom { username: "Host".into() }).await;
+            host.drain();
+            save_host(&server, &mut host).await;
+            server.saved.lock().unwrap().as_ref().unwrap().execute("DROP TABLE approved_guests", []).unwrap();
+            host.send(&server, ClientMessage::SeedRecovery { state: recovery_playlist(), guest_tokens: vec!["d".repeat(64)] }).await;
+            assert!(matches!(host.drain().as_slice(), [ServerMessage::Error { code, .. }] if code == "recovery_failed"));
+            let rooms = server.rooms.lock().await;
+            let room = &rooms[host.code.as_ref().unwrap()];
+            assert!(room.approved_guests.is_empty());
+            assert!(room.current_track.is_none() && room.queue.is_empty());
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn availability_checks_are_read_only_and_require_an_open_host() {
+        let server = Server::default();
+        let (mut host, mut guest, _) = room_with_guest(&server).await;
+        let code = host.code.clone().unwrap();
+        let mut probe = Conn::new();
+        for _ in 0..3 {
+            probe.send(&server, ClientMessage::CheckRoom { room_code: code.clone() }).await;
+            assert!(matches!(
+                probe.drain().as_slice(),
+                [ServerMessage::RoomAvailability { open: true, .. }]
+            ));
+        }
+        assert!(probe.uid.is_none() && probe.code.is_none(), "a probe never becomes a member");
+        assert!(
+            host.drain().is_empty() && guest.drain().is_empty(),
+            "no approval or member notifications"
+        );
+        assert_eq!(server.rooms.lock().await[&code].peers.len(), 2);
+        assert!(server.rooms.lock().await[&code].pending.is_empty());
+        server.handle_disconnect(host.uid.clone(), host.code.clone(), &host.tx).await;
+        probe.send(&server, ClientMessage::CheckRoom { room_code: code }).await;
+        assert!(matches!(
+            probe.drain().as_slice(),
+            [ServerMessage::RoomAvailability { open: false, .. }]
+        ));
+        probe.send(&server, ClientMessage::CheckRoom { room_code: "NOT-OPEN".into() }).await;
+        assert!(matches!(
+            probe.drain().as_slice(),
+            [ServerMessage::RoomAvailability { open: false, .. }]
+        ));
+        assert_eq!(server.rooms.lock().await.len(), 1, "a probe cannot reopen a room");
+    }
+
+    #[tokio::test]
+    async fn remembered_guest_reattaches_grace_slot_and_transferred_host_role() {
+        let server = Server::default();
+        let (mut host, guest, _) = room_with_guest(&server).await;
+        let code = guest.code.clone().unwrap();
+        let id = guest.id();
+        let pass = server.rooms.lock().await[&code].peers[&id].guest_token.clone().unwrap();
+        host.send(&server, ClientMessage::TransferHost { user_id: id.clone() }).await;
+        server.handle_disconnect(guest.uid.clone(), guest.code.clone(), &guest.tx).await;
+        assert!(!server.rooms.lock().await[&code].host_is_reachable());
+        let mut returning = Conn::new();
+        returning
+            .send(
+                &server,
+                ClientMessage::JoinSavedRoom {
+                    room_code: code.clone(),
+                    username: "guest".into(),
+                    guest_token: pass,
+                },
+            )
+            .await;
+        assert!(
+            matches!(returning.drain().as_slice(), [ServerMessage::JoinApproved { user_id, state, .. }] if user_id == &id && state.host_id == id)
+        );
+        assert_eq!(server.rooms.lock().await[&code].peers.len(), 2, "no duplicate grace slot");
+        server.handle_disconnect(guest.uid, guest.code, &guest.tx).await;
+        assert!(
+            server.rooms.lock().await[&code].peers[&id].connected,
+            "old socket cannot disconnect the returning guest"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_storage_failure_keeps_request_pending() {
+        let server = Server::with_store(std::path::Path::new(":memory:")).unwrap();
+        let mut host = Conn::new();
+        host.send(&server, ClientMessage::CreateRoom { username: "host".into() }).await;
+        save_host(&server, &mut host).await;
+        let mut guest = Conn::new();
+        guest
+            .send(
+                &server,
+                ClientMessage::JoinRoom {
+                    room_code: host.code.clone().unwrap(),
+                    username: "guest".into(),
+                },
+            )
+            .await;
+        host.drain();
+        server
+            .saved
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .execute_batch("DROP TABLE approved_guests")
+            .unwrap();
+        host.send(&server, ClientMessage::ApproveJoin { user_id: guest.id() }).await;
+        assert!(guest.drain().is_empty());
+        assert!(
+            matches!(host.drain().as_slice(), [ServerMessage::Error { code, .. }] if code == "storage_failed")
+        );
+        let rooms = server.rooms.lock().await;
+        let room = &rooms[host.code.as_ref().unwrap()];
+        assert!(room.pending.contains_key(&guest.id()));
+        assert!(room.approved_guests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remembered_approval_survives_restart_is_scoped_and_kick_revokes_it() {
+        let path = std::env::temp_dir().join(format!("limusic-approvals-{}.sqlite3", gen_token()));
+        let (code, owner_token, guest_token);
+        {
+            let server = Server::with_store(&path).unwrap();
+            let mut host = Conn::new();
+            host.send(&server, ClientMessage::CreateRoom { username: "host".into() }).await;
+            code = host.code.clone().unwrap();
+            let mut guest = Conn::new();
+            guest
+                .send(
+                    &server,
+                    ClientMessage::JoinRoom { room_code: code.clone(), username: "guest".into() },
+                )
+                .await;
+            assert!(guest.drain().is_empty());
+            host.send(&server, ClientMessage::ApproveJoin { user_id: guest.id() }).await;
+            guest_token = guest
+                .drain()
+                .into_iter()
+                .find_map(|m| match m {
+                    ServerMessage::JoinApproved { guest_token, .. } => guest_token,
+                    _ => None,
+                })
+                .unwrap();
+            guest.send(&server, ClientMessage::LeaveRoom).await;
+            host.drain();
+            let mut returning = Conn::new();
+            returning
+                .send(
+                    &server,
+                    ClientMessage::JoinSavedRoom {
+                        room_code: code.clone(),
+                        username: "renamed guest".into(),
+                        guest_token: guest_token.clone(),
+                    },
+                )
+                .await;
+            assert!(matches!(returning.drain().as_slice(), [ServerMessage::JoinApproved { .. }]));
+            assert!(!host.drain().iter().any(|m| matches!(m, ServerMessage::JoinRequest { .. })));
+            assert!(!server.rooms.lock().await[&code].is_host(&returning.id()));
+            // Saving an already active room also persists approvals issued before it was saved.
+            owner_token = save_host(&server, &mut host).await;
+        }
+        {
+            let server = Server::with_store(&path).unwrap();
+            let mut offline = Conn::new();
+            offline
+                .send(
+                    &server,
+                    ClientMessage::JoinSavedRoom {
+                        room_code: code.clone(),
+                        username: "guest".into(),
+                        guest_token: guest_token.clone(),
+                    },
+                )
+                .await;
+            assert!(
+                matches!(offline.drain().as_slice(), [ServerMessage::Error { code, .. }] if code == "room_not_found")
+            );
+            assert!(server.rooms.lock().await.is_empty(), "a credential cannot reopen a room");
+            let mut host = Conn::new();
+            host.send(
+                &server,
+                ClientMessage::OpenSavedRoom {
+                    room_code: code.clone(),
+                    owner_token: owner_token.clone(),
+                    username: "host".into(),
+                },
+            )
+            .await;
+            host.drain();
+            let mut guest = Conn::new();
+            guest
+                .send(
+                    &server,
+                    ClientMessage::JoinSavedRoom {
+                        room_code: code.clone(),
+                        username: "guest".into(),
+                        guest_token: guest_token.clone(),
+                    },
+                )
+                .await;
+            assert!(matches!(guest.drain().as_slice(), [ServerMessage::JoinApproved { .. }]));
+            assert!(!host.drain().iter().any(|m| matches!(m, ServerMessage::JoinRequest { .. })));
+            let mut other_host = Conn::new();
+            other_host.send(&server, ClientMessage::CreateRoom { username: "other".into() }).await;
+            let mut wrong_room = Conn::new();
+            wrong_room
+                .send(
+                    &server,
+                    ClientMessage::JoinSavedRoom {
+                        room_code: other_host.code.clone().unwrap(),
+                        username: "guest".into(),
+                        guest_token: guest_token.clone(),
+                    },
+                )
+                .await;
+            assert!(wrong_room.drain().is_empty(), "approval is scoped to its room");
+            assert!(other_host
+                .drain()
+                .iter()
+                .any(|m| matches!(m, ServerMessage::JoinRequest { .. })));
+            let mut imposter = Conn::new();
+            imposter
+                .send(
+                    &server,
+                    ClientMessage::JoinSavedRoom {
+                        room_code: code.clone(),
+                        username: "guest".into(),
+                        guest_token: "wrong".into(),
+                    },
+                )
+                .await;
+            assert!(imposter.drain().is_empty(), "display name does not grant access");
+            assert!(host.drain().iter().any(|m| matches!(m, ServerMessage::JoinRequest { .. })));
+            host.send(&server, ClientMessage::KickUser { user_id: guest.id() }).await;
+            assert!(matches!(guest.drain().as_slice(), [ServerMessage::Kicked { .. }]));
+        }
+        {
+            let server = Server::with_store(&path).unwrap();
+            let mut host = Conn::new();
+            host.send(
+                &server,
+                ClientMessage::OpenSavedRoom {
+                    room_code: code.clone(),
+                    owner_token,
+                    username: "host".into(),
+                },
+            )
+            .await;
+            let mut guest = Conn::new();
+            guest
+                .send(
+                    &server,
+                    ClientMessage::JoinSavedRoom {
+                        room_code: code,
+                        username: "guest".into(),
+                        guest_token,
+                    },
+                )
+                .await;
+            assert!(
+                guest.drain().is_empty(),
+                "kicking revokes remembered permission across restarts"
+            );
+            assert!(host.drain().iter().any(|m| matches!(m, ServerMessage::JoinRequest { .. })));
+            host.send(&server, ClientMessage::ApproveJoin { user_id: guest.id() }).await;
+            assert!(matches!(
+                guest.drain().as_slice(),
+                [ServerMessage::JoinApproved { guest_token: Some(_), .. }]
+            ));
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    async fn save_host(server: &Server, host: &mut Conn) -> String {
+        host.drain();
+        host.send(server, ClientMessage::SaveRoom).await;
+        host.drain()
+            .into_iter()
+            .find_map(|m| match m {
+                ServerMessage::RoomSaved { owner_token, .. } => Some(owner_token),
+                _ => None,
+            })
+            .expect("room reservation committed")
+    }
+
+    #[tokio::test]
+    async fn saved_identity_survives_last_leave_and_relay_restart() {
+        let path = std::env::temp_dir().join(format!("limusic-rooms-{}.sqlite3", gen_token()));
+        let code;
+        let token;
+        {
+            let server = Server::with_store(&path).unwrap();
+            let mut host = Conn::new();
+            host.send(&server, ClientMessage::CreateRoom { username: "owner".into() }).await;
+            code = host.code.clone().unwrap();
+            token = save_host(&server, &mut host).await;
+            host.send(&server, ClientMessage::LeaveRoom).await;
+            assert!(server.rooms.lock().await.is_empty());
+            assert_eq!(server.reservation(&code).unwrap(), Some(token.clone()));
+        }
+        {
+            let server = Server::with_store(&path).unwrap();
+            let mut intruder = Conn::new();
+            intruder
+                .send(
+                    &server,
+                    ClientMessage::OpenSavedRoom {
+                        room_code: code.clone(),
+                        owner_token: "wrong".into(),
+                        username: "bad".into(),
+                    },
+                )
+                .await;
+            assert!(matches!(intruder.drain().as_slice(), [ServerMessage::Error { .. }]));
+            assert!(server.rooms.lock().await.is_empty());
+
+            let mut owner = Conn::new();
+            owner
+                .send(
+                    &server,
+                    ClientMessage::OpenSavedRoom {
+                        room_code: code.clone(),
+                        owner_token: token,
+                        username: "owner".into(),
+                    },
+                )
+                .await;
+            let got = owner.drain();
+            assert!(
+                matches!(got.as_slice(), [ServerMessage::RoomCreated { state, .. }] if state.saved && state.room_code == code && state.current_track.is_none())
+            );
+
+            // The stable code works for guests again, but they still need approval.
+            let mut guest = Conn::new();
+            guest
+                .send(
+                    &server,
+                    ClientMessage::JoinRoom { room_code: code, username: "guest".into() },
+                )
+                .await;
+            assert!(guest.drain().is_empty());
+            owner.send(&server, ClientMessage::ApproveJoin { user_id: guest.id() }).await;
+            assert!(matches!(guest.drain().as_slice(), [ServerMessage::JoinApproved { .. }]));
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn saved_owner_reconnects_without_stealing_host_or_bypassing_approval() {
+        let server = Server::with_store(std::path::Path::new(":memory:")).unwrap();
+        let (mut host, mut guest, _) = room_with_guest(&server).await;
+        let token = save_host(&server, &mut host).await;
+        let code = host.code.clone().unwrap();
+        host.send(&server, ClientMessage::TransferHost { user_id: guest.id() }).await;
+        let mut back = Conn::new();
+        back.send(
+            &server,
+            ClientMessage::OpenSavedRoom {
+                room_code: code.clone(),
+                owner_token: token.clone(),
+                username: "owner".into(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            back.drain().as_slice(),
+            [ServerMessage::Reconnected { is_host: false, .. }]
+        ));
+        back.send(&server, ClientMessage::LeaveRoom).await;
+        guest.drain();
+
+        let mut returning = Conn::new();
+        returning
+            .send(
+                &server,
+                ClientMessage::OpenSavedRoom {
+                    room_code: code.clone(),
+                    owner_token: token.clone(),
+                    username: "owner".into(),
+                },
+            )
+            .await;
+        assert!(returning.drain().is_empty(), "explicit leave requires approval again");
+        assert!(matches!(guest.drain().as_slice(), [ServerMessage::JoinRequest { .. }]));
+        guest.send(&server, ClientMessage::ApproveJoin { user_id: returning.id() }).await;
+        returning.drain();
+        let mut again = Conn::new();
+        again
+            .send(
+                &server,
+                ClientMessage::OpenSavedRoom {
+                    room_code: code,
+                    owner_token: token,
+                    username: "owner".into(),
+                },
+            )
+            .await;
+        assert!(matches!(
+            again.drain().as_slice(),
+            [ServerMessage::Reconnected { is_host: false, .. }]
+        ));
+        assert_eq!(server.rooms.lock().await[&guest.code.clone().unwrap()].host_id, guest.id());
+        guest.send(&server, ClientMessage::SaveRoom).await;
+        assert!(
+            !guest.drain().iter().any(|m| matches!(m, ServerMessage::RoomSaved { .. })),
+            "successor must not receive owner token"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_storage_does_not_claim_room_is_saved() {
+        let server = Server::default(); // no durable store
+        let mut host = Conn::new();
+        host.send(&server, ClientMessage::CreateRoom { username: "host".into() }).await;
+        host.drain();
+        host.send(&server, ClientMessage::SaveRoom).await;
+        assert!(
+            matches!(host.drain().as_slice(), [ServerMessage::Error { code, .. }] if code == "save_failed")
+        );
+        assert!(!server.rooms.lock().await[&host.code.unwrap()].saved);
+    }
 
     fn dummy_tx() -> (Tx, mpsc::UnboundedReceiver<ServerMessage>) {
         mpsc::unbounded_channel()

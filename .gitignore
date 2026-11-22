@@ -31,3 +31,18 @@ rustypipe_reports/
 /plans
 scripts/bench.sh
 scripts/triage.py
+# Local build tools and durable relay state
+.build-tools/
+saved-rooms.sqlite3*
+/dist/
+/.svelte-kit/
+/.vite/
+/discord-voice/node_modules/
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.log

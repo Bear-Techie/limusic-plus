@@ -24,6 +24,7 @@
 		type PreviewTrack
 	} from '$lib/discord';
 	import DiscordCard from '$lib/components/DiscordCard.svelte';
+	import DiscordVoice from '$lib/components/DiscordVoice.svelte';
 
 	let { settings }: { settings: Record<string, string> } = $props();
 
@@ -176,6 +177,7 @@
      controls 200px wide is worse than scrolling past the card. -->
 <div class="flex min-h-0 flex-1 max-lg:flex-col">
 	<div class="min-w-0 flex-1 overflow-y-auto px-6 py-5">
+		<DiscordVoice {settings} />
 		<section class={GROUP}>
 			<div data-settings-card class={CARD}>
 				{@render row_({

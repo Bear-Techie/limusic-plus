@@ -8,6 +8,19 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Bounds shared playlists without silently reducing recovery to the next fifty songs.
+pub const MAX_SHARED_QUEUE: usize = 5000;
+pub const MAX_ROOM_MESSAGE: usize = 8 * 1024 * 1024;
+
+/// An approved participant's independent, ephemeral recovery endpoint. Never a room credential.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryPeer {
+    pub user_id: String,
+    pub username: String,
+    pub endpoint_id: String,
+    pub is_host: bool,
+}
+
 /// A track in the shared room. `id` is a raw YouTube videoId — the client resolves and plays it
 /// locally through the normal orchestrator; the server only relays it (context/19 Part B §6).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -39,6 +52,13 @@ pub struct User {
 /// The authoritative shared state the server owns and syncs to everyone.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RoomState {
+    #[serde(default)]
+    pub supports_recovery: bool,
+    #[serde(default)]
+    pub supports_saved_rooms: bool,
+    /// Durable identity; playback and membership are still temporary.
+    #[serde(default)]
+    pub saved: bool,
     pub room_code: String,
     pub host_id: String,
     pub users: Vec<User>,
@@ -131,6 +151,22 @@ impl Playback {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
+    /// Approved members only: advertise an independent encrypted recovery listener.
+    RegisterRecovery { endpoint_id: String },
+    /// New host only: seed an empty replacement room and grant fresh, room-scoped access.
+    SeedRecovery { state: RoomState, guest_tokens: Vec<String> },
+    /// Read-only availability probe. Never creates membership or an approval request.
+    CheckRoom {
+        room_code: String,
+    },
+    /// Host: reserve this room code durably.
+    SaveRoom,
+    /// Owner: reopen a reserved room, or reattach to its live session.
+    OpenSavedRoom {
+        room_code: String,
+        owner_token: String,
+        username: String,
+    },
     /// Create a room and become host.
     CreateRoom {
         username: String,
@@ -139,6 +175,12 @@ pub enum ClientMessage {
     JoinRoom {
         room_code: String,
         username: String,
+    },
+    /// A previously approved guest returns using a private, room-scoped credential.
+    JoinSavedRoom {
+        room_code: String,
+        username: String,
+        guest_token: String,
     },
     /// Re-attach after a dropped socket, using the token from create/join.
     Reconnect {
@@ -184,6 +226,16 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    RecoveryPeers { epoch: String, peers: Vec<RecoveryPeer> },
+    RecoveryReady { room_code: String },
+    RoomAvailability {
+        room_code: String,
+        open: bool,
+    },
+    RoomSaved {
+        room_code: String,
+        owner_token: String,
+    },
     RoomCreated {
         room_code: String,
         user_id: String,
@@ -198,6 +250,8 @@ pub enum ServerMessage {
     JoinApproved {
         user_id: String,
         session_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        guest_token: Option<String>,
         state: RoomState,
     },
     JoinRejected {

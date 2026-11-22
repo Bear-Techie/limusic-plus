@@ -751,7 +751,9 @@ impl Presence {
 
     /// Time left before the next connect attempt is allowed, or `None` when we may try now.
     fn connect_backoff_remaining(&self) -> Option<Duration> {
-        self.connect_backoff.checked_sub(self.last_connect_try?.elapsed())
+        self.connect_backoff
+            .checked_sub(self.last_connect_try?.elapsed())
+            .filter(|remaining| !remaining.is_zero())
     }
 
     fn ensure_connected(&mut self) -> bool {

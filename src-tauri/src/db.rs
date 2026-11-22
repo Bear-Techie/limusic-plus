@@ -442,12 +442,18 @@ impl Db {
     }
 
     pub fn set_setting(&self, key: &str, value: &str) {
+        let _ = self.set_setting_checked(key, value);
+    }
+
+    pub fn set_setting_checked(&self, key: &str, value: &str) -> Result<(), String> {
         let conn = self.0.lock().unwrap();
-        let _ = conn.execute(
+        conn.execute(
             "INSERT INTO settings(key, value) VALUES(?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [key, value],
-        );
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
     }
 
     pub fn delete_setting(&self, key: &str) {

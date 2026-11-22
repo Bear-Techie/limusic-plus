@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { page } from '$app/state';
+	import { appBrand } from '$lib/branding.svelte';
 	import { goto } from '$app/navigation';
 	import { scale } from 'svelte/transition';
 	import { HugeiconsIcon } from '@hugeicons/svelte';
@@ -110,7 +111,7 @@
 	)}"
 >
 	<div class="flex items-center justify-center px-2 py-2 {wide('lg:justify-between')}">
-		<span class="hidden font-heading text-lg font-bold tracking-tight {wide('lg:block')}">Limusic</span>
+		<span class="hidden font-heading text-lg font-bold tracking-tight {wide('lg:block')}">{appBrand.name}</span>
 		<!-- Column when collapsed: the two buttons don't fit side by side in the 64px rail. -->
 		<div class="flex items-center gap-1 {collapsed ? 'flex-col' : ''}">
 			<Button

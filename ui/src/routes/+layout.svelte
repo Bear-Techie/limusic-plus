@@ -13,6 +13,7 @@
 	import { afterNavigate } from '$app/navigation';
 	import { cancelRestore, restoreTo } from '$lib/scrollrestore';
 	import { onMount } from 'svelte';
+	import { appBrand, loadAppBrand } from '$lib/branding.svelte';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import { fly } from 'svelte/transition';
 	import { cubicOut } from 'svelte/easing';
@@ -42,6 +43,8 @@
 	import ShareDialog from '$lib/components/ShareDialog.svelte';
 	import ChannelPicker from '$lib/components/ChannelPicker.svelte';
 	import ListenTogether from '$lib/components/ListenTogether.svelte';
+	import RoomBotOffer from '$lib/components/RoomBotOffer.svelte';
+	import OpenRoomsOnStartup from '$lib/components/OpenRoomsOnStartup.svelte';
 	import LinkDialog from '$lib/components/LinkDialog.svelte';
 	import ImportDialog from '$lib/components/ImportDialog.svelte';
 	import { handleImportDrop, initImport } from '$lib/import.svelte';
@@ -161,6 +164,7 @@
 	// Wire the Tauri event bridge once for the whole app; teardown on destroy. Check for an update
 	// on every app open (silent unless one exists).
 	onMount(() => {
+		void loadAppBrand();
 		// Before the mini-window bail-out: both windows run this SPA and both can throw.
 		initErrorLog();
 		if (isMini) {
@@ -192,6 +196,7 @@
 	});
 </script>
 
+
 <!-- oncontextmenu: the app's own menus handle their right-click and stop the event, so anything
      that reaches the window is a place where WebKit would have offered back / reload / inspect.
      Text fields and selections keep the native menu (see `suppressNative`). -->
@@ -203,7 +208,10 @@
 	oncontextmenu={suppressNative}
 />
 
-<svelte:head><link rel="icon" href={favicon} /></svelte:head>
+<svelte:head>
+	<title>{isMini ? appBrand.name + ' Mini Player' : appBrand.name}</title>
+	<link rel="icon" href={favicon} />
+</svelte:head>
 <ModeWatcher />
 
 <!-- The mini player is the whole window when it is the window: no titlebar, no sidebar, no routes,
@@ -317,6 +325,8 @@
 	<TempoPitchDialog bind:open={ui.tempoPitchOpen} />
 	<ChannelPicker />
 	<ListenTogether />
+	<RoomBotOffer />
+	<OpenRoomsOnStartup />
 	<LinkDialog />
 	<ImportDialog />
 

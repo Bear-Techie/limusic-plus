@@ -15,6 +15,10 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 mod video;
 pub use video::{GlDisplay, Thumbnail, VideoRenderer};
+#[cfg(windows)]
+mod broadcast;
+#[cfg(windows)]
+pub use broadcast::{BroadcastSource, BroadcastTrack, PcmDecoder};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -203,6 +207,8 @@ struct Decks {
     /// earlier: that leaves the URL stranded, loaded by nobody, while the app has already
     /// recorded a lookahead. Read without the lock on the event thread, where it is a hint.
     fading: AtomicBool,
+    #[cfg(windows)]
+    fade_angle: AtomicU64,
     /// Bumped to cancel a fade in progress. The ramp thread captures it when it starts and stops
     /// as soon as the value no longer matches, so a pause, a seek or a skip mid-fade doesn't keep
     /// writing volumes to decks that have moved on.
@@ -408,6 +414,8 @@ impl Player {
             preload_gen: AtomicU64::new(0),
             preload_armed: AtomicU64::new(0),
             fading: AtomicBool::new(false),
+            #[cfg(windows)]
+            fade_angle: AtomicU64::new(0),
             fade_gen: AtomicU64::new(0),
             pending: Mutex::new(None),
             loop_file: AtomicBool::new(false),
@@ -1350,6 +1358,8 @@ fn start_crossfade(decks: &Arc<Decks>, from: usize, fade: f64) {
     // Read before `fading` goes up, which is what lets a cancel bump it: taken afterwards, a
     // cancel landing in between would be captured as the current value and never noticed.
     let gen = decks.fade_gen.load(Ordering::SeqCst);
+    #[cfg(windows)]
+    decks.fade_angle.store(0, Ordering::Relaxed);
     decks.fading.store(true, Ordering::Release);
     decks.active.store(1 - from, Ordering::SeqCst);
     video::deck_swapped(decks);
@@ -1398,6 +1408,8 @@ fn start_crossfade(decks: &Arc<Decks>, from: usize, fade: f64) {
                 break;
             }
             let turn = step as f64 / steps as f64 * std::f64::consts::FRAC_PI_2;
+            #[cfg(windows)]
+            decks.fade_angle.store(turn.to_bits(), Ordering::Relaxed);
             let vol = decks.volume.load(Ordering::Relaxed);
             let _ = out.set_property("volume", fade_volume(vol, turn.cos()));
             let _ = incoming.set_property("volume", fade_volume(vol, turn.sin()));
