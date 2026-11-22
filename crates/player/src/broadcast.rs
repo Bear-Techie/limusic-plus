@@ -98,7 +98,7 @@ impl BroadcastTrack {
         mpv.set_property("speed", self.speed)?;
         mpv.set_property("volume", 100.0)?;
         mpv.set_property("mute", false)?;
-        let args = loadfile_args(&self.path, Some(self.position), loadfile_has_index(&mpv));
+        let args = loadfile_args(&self.path, Some(self.position), &[], loadfile_has_index(&mpv));
         mpv.command("loadfile", &args.iter().map(String::as_str).collect::<Vec<_>>())?;
         Ok(PcmDecoder { _mpv: mpv })
     }

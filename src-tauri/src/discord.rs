@@ -751,6 +751,7 @@ impl Presence {
 
     /// Time left before the next connect attempt is allowed, or `None` when we may try now.
     fn connect_backoff_remaining(&self) -> Option<Duration> {
+        // On a coarse clock (Windows) elapsed can equal the backoff exactly: nothing left means go.
         self.connect_backoff
             .checked_sub(self.last_connect_try?.elapsed())
             .filter(|remaining| !remaining.is_zero())
