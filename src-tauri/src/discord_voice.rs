@@ -149,7 +149,11 @@ pub fn voice_start(
             return Err("channel");
         }
         let channel_name = channel_name.filter(|name| !name.is_empty()).unwrap_or_else(|| {
-            if bot.channel == channel { bot.channel_name.clone() } else { String::new() }
+            if bot.channel == channel {
+                bot.channel_name.clone()
+            } else {
+                String::new()
+            }
         });
         if bot.id != "legacy" && (bot.channel != channel || bot.channel_name != channel_name) {
             bot.channel = channel.clone();

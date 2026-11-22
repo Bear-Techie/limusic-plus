@@ -4798,8 +4798,14 @@ impl AppState {
         if !lt_host && !self.link.linked() {
             return;
         }
-        let queue_limit = if lt_host { listen_protocol::MAX_SHARED_QUEUE } else { listen_protocol::MAX_LINK_QUEUE };
-        let Some(p) = self.current_change_track(position_ms, playing, queue_limit).await else { return };
+        let queue_limit = if lt_host {
+            listen_protocol::MAX_SHARED_QUEUE
+        } else {
+            listen_protocol::MAX_LINK_QUEUE
+        };
+        let Some(p) = self.current_change_track(position_ms, playing, queue_limit).await else {
+            return;
+        };
         if self.link.linked() {
             let mut link_playback = p.clone();
             if let Some(queue) = link_playback.queue.as_mut() {
@@ -4816,7 +4822,12 @@ impl AppState {
     }
 
     /// The current track and the channel's supported number of upcoming tracks as a ChangeTrack.
-    async fn current_change_track(&self, position_ms: i64, playing: bool, queue_limit: usize) -> Option<Playback> {
+    async fn current_change_track(
+        &self,
+        position_ms: i64,
+        playing: bool,
+        queue_limit: usize,
+    ) -> Option<Playback> {
         let q = self.queue.lock().await;
         let cur = q.items.get(q.current)?;
         let mut p = Playback::at(PlaybackKind::ChangeTrack, position_ms);
@@ -4826,7 +4837,8 @@ impl AppState {
             track.duration_ms = (q.duration * 1000.0) as i64;
         }
         p.track = Some(track);
-        p.queue = Some(q.items.iter().skip(q.current + 1).take(queue_limit).map(song_to_track).collect());
+        p.queue =
+            Some(q.items.iter().skip(q.current + 1).take(queue_limit).map(song_to_track).collect());
         p.playing = playing;
         Some(p)
     }
@@ -4835,7 +4847,10 @@ impl AppState {
     /// becomes a takeover, a ChangeTrack built from what we are playing.
     async fn link_publish(&self, p: Playback) {
         if self.link.publish(p.clone()) == Publish::Takeover {
-            if let Some(ct) = self.current_change_track(p.position_ms, true, listen_protocol::MAX_LINK_QUEUE).await {
+            if let Some(ct) = self
+                .current_change_track(p.position_ms, true, listen_protocol::MAX_LINK_QUEUE)
+                .await
+            {
                 self.link.publish(ct);
                 self.link_publish_volume();
                 self.link_publish_status().await;
@@ -4903,12 +4918,19 @@ impl AppState {
         let q = self.queue.lock().await;
         listen_protocol::RoomState {
             current_track: q.items.get(q.current).map(song_to_track),
-            queue: q.items.iter().skip(q.current + 1)
-                .take(listen_protocol::MAX_SHARED_QUEUE).map(song_to_track).collect(),
+            queue: q
+                .items
+                .iter()
+                .skip(q.current + 1)
+                .take(listen_protocol::MAX_SHARED_QUEUE)
+                .map(song_to_track)
+                .collect(),
             position_ms: (self.current_position() * 1000.0) as i64,
             is_playing: self.is_playing.load(Ordering::Relaxed),
-            last_update_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64).unwrap_or_default(),
+            last_update_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or_default(),
             ..Default::default()
         }
     }
@@ -5473,8 +5495,12 @@ impl AppState {
         }
         let queue: Vec<Track> = {
             let q = self.queue.lock().await;
-            q.items.iter().skip(q.current + 1)
-                .take(listen_protocol::MAX_SHARED_QUEUE).map(song_to_track).collect()
+            q.items
+                .iter()
+                .skip(q.current + 1)
+                .take(listen_protocol::MAX_SHARED_QUEUE)
+                .map(song_to_track)
+                .collect()
         };
         let mut p = Playback::new(PlaybackKind::SyncQueue);
         p.queue = Some(queue);
@@ -5564,7 +5590,10 @@ impl AppState {
             LinkCommand::Republish => {
                 if self.is_playing.load(Ordering::Relaxed) {
                     let pos_ms = (self.current_position() * 1000.0) as i64;
-                    if let Some(p) = self.current_change_track(pos_ms, true, listen_protocol::MAX_LINK_QUEUE).await {
+                    if let Some(p) = self
+                        .current_change_track(pos_ms, true, listen_protocol::MAX_LINK_QUEUE)
+                        .await
+                    {
                         self.link.publish(p);
                         self.link_publish_volume();
                         self.link_publish_status().await;

@@ -276,9 +276,14 @@ fn is_false(b: &bool) -> bool {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     /// Approved members only: advertise an independent encrypted recovery listener.
-    RegisterRecovery { endpoint_id: String },
+    RegisterRecovery {
+        endpoint_id: String,
+    },
     /// New host only: seed an empty replacement room and grant fresh, room-scoped access.
-    SeedRecovery { state: RoomState, guest_tokens: Vec<String> },
+    SeedRecovery {
+        state: RoomState,
+        guest_tokens: Vec<String>,
+    },
     /// Read-only availability probe. Never creates membership or an approval request.
     CheckRoom {
         room_code: String,
@@ -374,8 +379,13 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
-    RecoveryPeers { epoch: String, peers: Vec<RecoveryPeer> },
-    RecoveryReady { room_code: String },
+    RecoveryPeers {
+        epoch: String,
+        peers: Vec<RecoveryPeer>,
+    },
+    RecoveryReady {
+        room_code: String,
+    },
     RoomAvailability {
         room_code: String,
         open: bool,

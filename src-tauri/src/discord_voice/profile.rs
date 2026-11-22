@@ -1,7 +1,7 @@
 use base64::Engine as _;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue, USER_AGENT};
+use reqwest::header::{HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use reqwest::{Response, StatusCode};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::time::Duration;
 
 const DISCORD_API: &str = "https://discord.com/api/v10";

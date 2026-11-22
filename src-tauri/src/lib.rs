@@ -11,8 +11,6 @@ mod devicelink;
 mod diagnostics;
 mod discord;
 mod discord_voice;
-#[cfg(windows)]
-mod plus_update;
 mod hotkeys;
 mod http;
 mod import;
@@ -37,6 +35,8 @@ mod nativevideo;
 mod nativevideo;
 mod notify;
 mod orchestrator;
+#[cfg(windows)]
+mod plus_update;
 mod potoken;
 mod romanize;
 mod session;

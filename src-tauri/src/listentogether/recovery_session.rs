@@ -86,27 +86,47 @@ impl LtSession {
     pub(super) async fn refresh_bot_room(&self) {
         let inner = self.inner.lock().await;
         let context = self.recovery_context.lock().await;
-        let room = context.as_ref().filter(|context| inner.status_connected
-            && inner.my_id.as_deref() == Some(context.my_id.as_str())
-            && peer::is_peer(&inner.server_url)).map(|context| {
-            let host = context.peers.iter().find(|p| inner.users.iter().any(|u|
-                u.user_id == p.user_id && u.is_host && u.is_connected));
-            bot_share::Room {
-                epoch: context.epoch.clone(),
-                host: host.filter(|p| p.user_id != context.my_id)
-                    .map(|p| (p.endpoint_id.clone(), p.username.clone())),
-                guests: context.peers.iter().filter(|p| inner.role == Role::Host
-                    && p.user_id != context.my_id
-                    && inner.users.iter().any(|u| u.user_id == p.user_id && u.is_connected))
-                    .map(|p| p.endpoint_id.clone()).collect(),
-            }
-        });
+        let room = context
+            .as_ref()
+            .filter(|context| {
+                inner.status_connected
+                    && inner.my_id.as_deref() == Some(context.my_id.as_str())
+                    && peer::is_peer(&inner.server_url)
+            })
+            .map(|context| {
+                let host = context.peers.iter().find(|p| {
+                    inner
+                        .users
+                        .iter()
+                        .any(|u| u.user_id == p.user_id && u.is_host && u.is_connected)
+                });
+                bot_share::Room {
+                    epoch: context.epoch.clone(),
+                    host: host
+                        .filter(|p| p.user_id != context.my_id)
+                        .map(|p| (p.endpoint_id.clone(), p.username.clone())),
+                    guests: context
+                        .peers
+                        .iter()
+                        .filter(|p| {
+                            inner.role == Role::Host
+                                && p.user_id != context.my_id
+                                && inner
+                                    .users
+                                    .iter()
+                                    .any(|u| u.user_id == p.user_id && u.is_connected)
+                        })
+                        .map(|p| p.endpoint_id.clone())
+                        .collect(),
+                }
+            });
         self.recovery.set_bot_room(room).await;
     }
 
     pub(crate) async fn share_bot(&self, bot: bot_share::BotPayload) -> Result<usize, String> {
         let inner = self.inner.lock().await;
-        if !inner.status_connected || inner.role != Role::Host || !peer::is_peer(&inner.server_url) {
+        if !inner.status_connected || inner.role != Role::Host || !peer::is_peer(&inner.server_url)
+        {
             return Err("Only the host of a connected Plus room can share a bot.".into());
         }
         drop(inner);
@@ -130,7 +150,9 @@ impl LtSession {
             return Err("The room is no longer connected.".into());
         }
         let bot = self.recovery.accept_bot(id).await?;
-        if self.gen.load(Ordering::SeqCst) != generation || !self.inner.lock().await.status_connected {
+        if self.gen.load(Ordering::SeqCst) != generation
+            || !self.inner.lock().await.status_connected
+        {
             return Err("The room changed while accepting the bot.".into());
         }
         Ok(bot)
@@ -195,7 +217,10 @@ impl LtSession {
             return;
         }
         let mut inner = self.inner.lock().await;
-        if self.gen.load(Ordering::SeqCst) != generation || inner.status_connected || inner.recovery_busy {
+        if self.gen.load(Ordering::SeqCst) != generation
+            || inner.status_connected
+            || inner.recovery_busy
+        {
             return;
         }
         let inviter = offers.first().map(|(p, _)| p.username.clone());

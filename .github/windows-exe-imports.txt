@@ -39,6 +39,8 @@ crypt32.dll
 dbghelp.dll
 dwmapi.dll
 gdi32.dll
+# Windows IP Helper for the Plus peer networking stack.
+iphlpapi.dll
 kernel32.dll
 libmpv-2.dll
 ntdll.dll

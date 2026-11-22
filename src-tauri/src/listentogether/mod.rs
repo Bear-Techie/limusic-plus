@@ -338,7 +338,10 @@ fn own_room(
         let room: SavedRoom = serde_json::from_str(&json)
             .map_err(|_| "Your own room could not be read. Restore your app data backup.")?;
         if room.server_url != address || room.owner_token.is_none() {
-            return Err("Your own room does not match this hosting identity. Restore your app data backup.".into());
+            return Err(
+                "Your own room does not match this hosting identity. Restore your app data backup."
+                    .into(),
+            );
         }
         return Ok(Some(room));
     }
@@ -431,10 +434,8 @@ impl LtSession {
         if self.saved_load_error.is_some() {
             return Err("Saved room data could not be read; repair it before saving.".into());
         }
-        let recovery_room = matches!(
-            *self.recovery_transition.lock().await,
-            Some(RecoveryTransition::Host { .. })
-        );
+        let recovery_room =
+            matches!(*self.recovery_transition.lock().await, Some(RecoveryTransition::Host { .. }));
         let primary = owner_token.is_some()
             && self.app.config().identifier == "com.limusic.plus"
             && !recovery_room;
@@ -514,9 +515,10 @@ impl LtSession {
             return Err("Saved room data could not be read; repair it before saving.".into());
         }
         let mut saved = self.saved.lock().await;
-        if saved.iter().any(|r| {
-            r.server_url == server && r.room_code == code && r.owner_token.is_some()
-        }) {
+        if saved
+            .iter()
+            .any(|r| r.server_url == server && r.room_code == code && r.owner_token.is_some())
+        {
             return Err("Your own rooms are permanent and cannot be forgotten.".into());
         }
         let next: Vec<_> = saved
@@ -742,7 +744,9 @@ impl LtSession {
         let _action = self.hosting_action.try_lock().map_err(|_| "A room is already opening.")?;
         if self.app.config().identifier == "com.limusic.plus" {
             if self.saved_load_error.is_some() {
-                return Err("Saved rooms could not be read. Restore your app data before hosting.".into());
+                return Err(
+                    "Saved rooms could not be read. Restore your app data before hosting.".into()
+                );
             }
             if self.in_room().await || self.inner.lock().await.requesting {
                 return Err("Leave the current room first.".into());
@@ -1142,7 +1146,10 @@ impl LtSession {
                 self.inner.lock().await.recovery_busy = false;
                 if recovered {
                     if let Err(error) = self.remember_room(None).await {
-                        self.emit_notice(&format!("Joined the replacement room, but could not save its shortcut: {error}")).await;
+                        self.emit_notice(&format!(
+                            "Joined the replacement room, but could not save its shortcut: {error}"
+                        ))
+                        .await;
                     }
                 }
                 self.register_recovery(supports_recovery).await;
@@ -1521,13 +1528,11 @@ mod tests {
 
     #[test]
     fn own_room_stays_pinned_across_restart_shortcut_changes_and_recovery() {
-        let path = std::env::temp_dir().join(format!("limusic-own-{}.sqlite", rand::random::<u64>()));
+        let path =
+            std::env::temp_dir().join(format!("limusic-own-{}.sqlite", rand::random::<u64>()));
         let original: SavedRoom = serde_json::from_str(r#"{"server_url":"limusic-peer://me","room_code":"ORIGINAL","username":"owner","owner_token":"private"}"#).unwrap();
-        let recovery = SavedRoom {
-            recovery_room: true,
-            room_code: "RECOVERY".into(),
-            ..original.clone()
-        };
+        let recovery =
+            SavedRoom { recovery_room: true, room_code: "RECOVERY".into(), ..original.clone() };
         {
             let db = crate::db::Db::open(&path).unwrap();
             assert!(own_room(&db, &[recovery.clone()], &original.server_url).unwrap().is_none());

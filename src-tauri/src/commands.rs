@@ -3079,7 +3079,9 @@ fn plus_release_repo() -> Result<Option<&'static str>, String> {
             && s != ".."
             && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
     };
-    if !repo.split_once('/').is_some_and(|(owner, name)| valid_segment(owner) && valid_segment(name))
+    if !repo
+        .split_once('/')
+        .is_some_and(|(owner, name)| valid_segment(owner) && valid_segment(name))
         || repo.eq_ignore_ascii_case("SimoHypers/limusic")
     {
         return Err("Invalid Limusic Plus release repository.".into());
@@ -3104,11 +3106,8 @@ struct PlusRelease {
 
 #[tauri::command]
 pub async fn check_plus_release(app: tauri::AppHandle) -> Result<PlusReleaseCheck, String> {
-    let repo = if app.config().identifier == "com.limusic.plus" {
-        plus_release_repo()?
-    } else {
-        None
-    };
+    let repo =
+        if app.config().identifier == "com.limusic.plus" { plus_release_repo()? } else { None };
     let Some(repo) = repo else {
         return Ok(PlusReleaseCheck { configured: false, release: None });
     };
@@ -3165,25 +3164,27 @@ pub async fn check_plus_release(app: tauri::AppHandle) -> Result<PlusReleaseChec
     if !stable_version {
         return Err("Invalid Limusic Plus release tag.".into());
     }
-    let latest: PublishedRelease = request(format!(
-        "https://api.github.com/repos/{repo}/releases/tags/{tag}"
-    ))
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+    let latest: PublishedRelease =
+        request(format!("https://api.github.com/repos/{repo}/releases/tags/{tag}"))
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
     let installer = format!("Limusic-Plus-{version}-setup-x64.exe");
     let can_install = {
         #[cfg(windows)]
         {
             let manifest = format!("{installer}.update.json");
             crate::plus_update::can_install()
-                && latest.assets.iter().any(|asset| asset.state == "uploaded" && asset.name == manifest)
+                && latest
+                    .assets
+                    .iter()
+                    .any(|asset| asset.state == "uploaded" && asset.name == manifest)
         }
         #[cfg(not(windows))]
         false
@@ -3242,11 +3243,14 @@ pub async fn release_notes(app: tauri::AppHandle) -> Result<Vec<ReleaseNote>, St
     }
     let releases: Vec<GhRelease> = crate::http::client()
         .get(format!("https://api.github.com/repos/{repo}/releases?per_page=20"))
-        .header("User-Agent", if repo == "SimoHypers/limusic" {
-            concat!("Limusic/", env!("CARGO_PKG_VERSION"))
-        } else {
-            "Limusic-Plus"
-        })
+        .header(
+            "User-Agent",
+            if repo == "SimoHypers/limusic" {
+                concat!("Limusic/", env!("CARGO_PKG_VERSION"))
+            } else {
+                "Limusic-Plus"
+            },
+        )
         .header("Accept", "application/vnd.github+json")
         .timeout(std::time::Duration::from_secs(15))
         .send()

@@ -8,8 +8,8 @@ use std::{
 };
 
 use super::bot_share::{BotPayload, Notice, Request as BotRequest, Room, Shares};
-use futures_util::{StreamExt, stream};
-use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
+use futures_util::{stream, StreamExt};
+use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId};
 use listen_protocol::RecoveryPeer;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Semaphore};
@@ -346,26 +346,43 @@ mod tests {
         let guest_shares = Arc::new(Mutex::new(Shares::default()));
         let epoch = "share-session".to_owned();
         host_shares.lock().await.set_room(Some(Room {
-            epoch: epoch.clone(), host: None, guests: [guest_id].into(),
+            epoch: epoch.clone(),
+            host: None,
+            guests: [guest_id].into(),
         }));
         guest_shares.lock().await.set_room(Some(Room {
-            epoch: epoch.clone(), host: Some((host_id, "Room host".into())), guests: Default::default(),
+            epoch: epoch.clone(),
+            host: Some((host_id, "Room host".into())),
+            guests: Default::default(),
         }));
         let host_task = serve(host.clone(), Arc::default(), host_shares.clone());
         let guest_task = serve(guest.clone(), Arc::default(), guest_shares.clone());
-        let (_, mut offers) = host_shares.lock().await.offer(BotPayload {
-            id: "123".into(), name: "Music bot".into(), channel: "456".into(), token: "test.token".into(),
-        }).unwrap();
+        let (_, mut offers) = host_shares
+            .lock()
+            .await
+            .offer(BotPayload {
+                id: "123".into(),
+                name: "Music bot".into(),
+                channel: "456".into(),
+                token: "test.token".into(),
+            })
+            .unwrap();
         let (_, offer) = offers.pop().unwrap();
         let encode = |bot| Request { epoch: epoch.clone(), bot: Some(bot) };
         assert!(!serde_json::to_string(&offer).unwrap().contains("test.token"));
         assert!(exchange(&outsider, guest.addr(), encode(offer.clone())).await.unwrap().is_null());
-        assert_eq!(exchange(&host, guest.addr(), encode(offer)).await.unwrap(), serde_json::Value::Bool(true));
+        assert_eq!(
+            exchange(&host, guest.addr(), encode(offer)).await.unwrap(),
+            serde_json::Value::Bool(true)
+        );
         let notice = guest_shares.lock().await.notices().pop().unwrap();
         assert!(!serde_json::to_string(&notice).unwrap().contains("test.token"));
         let accept = BotRequest::Accept { id: notice.id };
         assert!(exchange(&outsider, host.addr(), encode(accept.clone())).await.unwrap().is_null());
-        assert_eq!(exchange(&guest, host.addr(), encode(accept.clone())).await.unwrap()["token"], "test.token");
+        assert_eq!(
+            exchange(&guest, host.addr(), encode(accept.clone())).await.unwrap()["token"],
+            "test.token"
+        );
         host_shares.lock().await.set_room(None);
         assert!(exchange(&guest, host.addr(), encode(accept)).await.unwrap().is_null());
         host_task.abort();
