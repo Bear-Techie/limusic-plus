@@ -5,9 +5,11 @@
 	import { Input } from '$lib/components/ui/input';
 	import { openExternal, setSetting } from '$lib/api';
 	import { t } from '$lib/i18n.svelte';
-	import { toast } from '$lib/player.svelte';
+	import { toast, ui } from '$lib/player.svelte';
+	import { canStartRoom } from '$lib/lt.svelte';
 	import limusicIcon from '../../../../src-tauri/icons/icon.png?inline';
 	import { botLibrary, loadBots } from '$lib/discord-bots.svelte';
+	import DiscordRoomOffer from './DiscordRoomOffer.svelte';
 
 	type BotCatalog = {
 		id: string;
@@ -27,6 +29,7 @@
 	let status = $state('');
 	let actionError = $state('');
 	let busy = $state(false);
+	let offerRoom = $state(false);
 	const active = $derived(['connecting', 'reconnecting', 'live', 'stopping'].includes(status));
 	const configured = $derived(botLibrary.entries.some((bot) => bot.id === botId));
 	const settingUp = $derived(loaded && (!configured || replacing));
@@ -204,6 +207,7 @@
 		try {
 			await invoke('voice_start', { botId, channel: channel.trim(), channelName: channelName?.name });
 			await refresh();
+			offerRoom = canStartRoom();
 			await saveChannel().catch((error) => toast.error(String(error)));
 			await loadBots().catch(() => {});
 		} catch (error) {
@@ -214,6 +218,7 @@
 	}
 
 	async function leave() {
+		offerRoom = false;
 		busy = true;
 		actionError = '';
 		try {
@@ -353,6 +358,13 @@
 					{@render profileAction()}
 				{/if}
 			</form>
+		{/if}
+		{#if offerRoom && active && status !== 'stopping'}
+			<DiscordRoomOffer onDismiss={() => (offerRoom = false)} onRoomOpening={() => {
+				offerRoom = false;
+				ui.settingsOpen = false;
+				ui.ltOpen = true;
+			}} />
 		{/if}
 		<div aria-live="polite">
 			{#if actionError || messages[status]}

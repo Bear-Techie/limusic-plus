@@ -9,11 +9,14 @@
 	import { getSettings, setSetting } from '$lib/api';
 	import { botLibrary, loadBots } from '$lib/discord-bots.svelte';
 	import { t } from '$lib/i18n.svelte';
+	import { canStartRoom } from '$lib/lt.svelte';
 	import { prefs, toast, ui } from '$lib/player.svelte';
 	import DiscordIcon from './DiscordIcon.svelte';
+	import DiscordRoomOffer from './DiscordRoomOffer.svelte';
 
 	type VoiceChannel = { id: string; name: string; guild: string };
 	let open = $state(false);
+	let offerRoom = $state(false);
 	let trigger = $state<HTMLButtonElement | null>(null);
 	let status = $state('');
 	let botId = $state('');
@@ -91,6 +94,7 @@
 	}
 
 	async function show() {
+		offerRoom = false;
 		open = true;
 		busy = true;
 		error = '';
@@ -130,6 +134,7 @@
 		try {
 			await invoke('voice_start', { botId, channel, channelName });
 			await refresh();
+			offerRoom = canStartRoom();
 			await Promise.all([
 				setSetting('discord_voice_bot_id', botId),
 				setSetting('discord_voice_channel', channel)
@@ -142,6 +147,7 @@
 	}
 
 	async function leave() {
+		offerRoom = false;
 		busy = true;
 		error = '';
 		try {
@@ -193,11 +199,18 @@
 </DropdownMenu.Root>
 
 <Dialog.Root bind:open>
-	<Dialog.Content onCloseAutoFocus={(event) => { event.preventDefault(); trigger?.focus(); }}>
+	<Dialog.Content onCloseAutoFocus={(event) => { event.preventDefault(); if (!ui.ltOpen) trigger?.focus(); }}>
 		<Dialog.Header>
 			<Dialog.Title>{t('settings.discord_voice.quick_title')}</Dialog.Title>
 			<Dialog.Description>{t('settings.discord_voice.quick_hint')}</Dialog.Description>
 		</Dialog.Header>
+		{#if offerRoom && active && status !== 'stopping'}
+			<DiscordRoomOffer onDismiss={() => (offerRoom = false)} onRoomOpening={() => {
+				offerRoom = false;
+				open = false;
+				ui.ltOpen = true;
+			}} />
+		{/if}
 		{#if active}
 			<Button size="sm" variant="outline" disabled={busy || status === 'stopping'} onclick={leave}>
 				{t('settings.discord_voice.stop')}

@@ -33,6 +33,11 @@ export function inRoom(): boolean {
 	return lt.role !== 'none';
 }
 
+export function canStartRoom(): boolean {
+	return !inRoom() && lt.status === 'disconnected' && !lt.requesting
+		&& !lt.recoveryDisconnected && !lt.recoveryBusy;
+}
+
 /** Replace the reactive state from a fresh `lt-state` snapshot. */
 export function applyLtState(s: LtState) {
 	Object.assign(lt, s);

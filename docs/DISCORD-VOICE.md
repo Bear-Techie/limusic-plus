@@ -13,6 +13,11 @@ After setup, open the **Discord** menu in the title bar and select **Send bot**
 to start or stop a broadcast. Pick a saved bot and use its last channel by name,
 or look up a different Discord voice channel.
 
+When you start broadcasting outside a Listen Together room, Limusic Plus offers
+to host one. **Reopen room** opens your most recently used hosted room with the
+same invite. If you haven't hosted a saved room, **Host a room** opens a room
+using your Listen Together name. You can also choose **Just broadcast**.
+
 1. Select **Install Discord broadcasting** in the Limusic Plus Windows
    installer. You can rerun the installer later to add the feature. The installer
    includes Node.js and the bot dependencies. To remove them, rerun the installer
