@@ -50,12 +50,15 @@ room data, or a telemetry payload. GitHub receives the ordinary network request.
 
 Run `scripts/build-windows-installer.ps1` to build with the
 [Limusic Plus release feed](https://github.com/Bear-Techie/limusic-plus/releases).
-Build from the `plus` branch and publish the installer, SHA-256 file, and source
+Build from `master` and publish the installer, SHA-256 file, and source
 archive together under a stable tag such as `v2.0.4`. After the release is
 public and the installer is available, set `tag` in `releases/plus.json` on
-`plus` to that tag. This file is the update channel's release pointer. Leave
+`master` to that tag. This file is the update channel's release pointer. Leave
 it at `null` until the first release and keep it unchanged during upstream
 syncs and integration testing.
+
+The fork keeps the upstream snapshot on `source` and tests upstream changes
+on `merge` before merging them into `master`.
 To build for another public fork, pass `-ReleaseRepo owner/repo` or set
 `LIMUSIC_PLUS_RELEASE_REPO` in the build environment. Pass `-ReleaseRepo ''`
 to make a local installer with the feed disabled.

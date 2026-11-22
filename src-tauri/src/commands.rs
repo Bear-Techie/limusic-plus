@@ -3134,7 +3134,7 @@ pub async fn check_plus_release(app: tauri::AppHandle) -> Result<PlusReleaseChec
     };
     let no_release = PlusReleaseCheck { configured: true, release: None };
     let pointer = request(format!(
-        "https://raw.githubusercontent.com/{repo}/refs/heads/plus/releases/plus.json"
+        "https://raw.githubusercontent.com/{repo}/refs/heads/master/releases/plus.json"
     ))
     .send()
     .await
